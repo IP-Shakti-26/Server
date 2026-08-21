@@ -69,9 +69,10 @@ func (s *Store) GetSession(ctx context.Context, id string) (*Session, error) {
 	return sess, err
 }
 
-// UpdateClassification stores the classifier output and marks classification
-// as done.
-func (s *Store) UpdateClassification(ctx context.Context, id string, result *domain.ClassificationResult) error {
+// SaveClassification persists the classifier output.
+// done=true marks the session as fully classified (no clarification needed).
+// done=false saves the partial result but keeps the session open for /clarify.
+func (s *Store) SaveClassification(ctx context.Context, id string, result *domain.ClassificationResult, done bool) error {
 	data, err := json.Marshal(result)
 	if err != nil {
 		return fmt.Errorf("marshal classification: %w", err)
@@ -79,13 +80,13 @@ func (s *Store) UpdateClassification(ctx context.Context, id string, result *dom
 	const q = `
 		UPDATE sessions
 		SET    classification      = $2,
-		       classification_done = TRUE,
+		       classification_done = $3,
 		       updated_at          = NOW()
 		WHERE  id = $1`
 
-	tag, err := s.pool.Exec(ctx, q, id, data)
+	tag, err := s.pool.Exec(ctx, q, id, data, done)
 	if err != nil {
-		return fmt.Errorf("update classification: %w", err)
+		return fmt.Errorf("save classification: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrSessionNotFound

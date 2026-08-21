@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/heythisissud/ip-sakti-backend/internal/api"
+	"github.com/heythisissud/ip-sakti-backend/internal/classifier"
 	"github.com/heythisissud/ip-sakti-backend/internal/store"
 	"github.com/heythisissud/ip-sakti-backend/pkg/config"
+	"google.golang.org/genai"
 )
 
 func main() {
@@ -30,10 +32,10 @@ func main() {
 	logger.Info("config loaded", "env", cfg.Env, "port", cfg.Port)
 
 	// ── Database pool ─────────────────────────────────────────────────────
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	initCtx, initCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer initCancel()
 
-	pool, err := store.NewPool(ctx, cfg.DatabaseURL)
+	pool, err := store.NewPool(initCtx, cfg.DatabaseURL)
 	if err != nil {
 		logger.Error("failed to connect to database", "error", err)
 		os.Exit(1)
@@ -41,9 +43,21 @@ func main() {
 	defer pool.Close()
 	logger.Info("database connected")
 
+	// ── Gemini client ─────────────────────────────────────────────────────
+	geminiClient, err := genai.NewClient(context.Background(), &genai.ClientConfig{
+		APIKey:  cfg.GeminiAPIKey,
+		Backend: genai.BackendGeminiAPI,
+	})
+	if err != nil {
+		logger.Error("failed to create Gemini client", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("Gemini client initialised")
+
 	// ── Dependency injection ──────────────────────────────────────────────
 	st := store.NewStore(pool)
-	h := api.NewHandler(cfg, pool, st, logger)
+	cl := classifier.NewClassifier(geminiClient, logger)
+	h := api.NewHandler(cfg, pool, st, cl, logger)
 	router := api.NewRouter(h, cfg, logger)
 
 	// ── HTTP server ───────────────────────────────────────────────────────
@@ -55,7 +69,6 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	// Start server in a goroutine so we can listen for shutdown signals.
 	serverErr := make(chan error, 1)
 	go func() {
 		logger.Info("server starting", "addr", srv.Addr)

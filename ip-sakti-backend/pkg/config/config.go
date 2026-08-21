@@ -13,11 +13,12 @@ import (
 type Config struct {
 	Port            string
 	DatabaseURL     string
-	AnthropicAPIKey string
+	GeminiAPIKey    string   // GEMINI_API_KEY, required
+	AnthropicAPIKey string   // ANTHROPIC_API_KEY, optional (future)
 	QdrantHost      string
 	QdrantPort      string
 	QdrantAPIKey    string
-	OpenAIAPIKey    string
+	OpenAIAPIKey    string   // OPENAI_API_KEY, optional (for embeddings, future)
 	Env             string
 	AllowedOrigins  []string
 }
@@ -31,6 +32,7 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		Port:            getEnvOrDefault("SERVER_PORT", "8080"),
 		DatabaseURL:     os.Getenv("DATABASE_URL"),
+		GeminiAPIKey:    os.Getenv("GEMINI_API_KEY"),
 		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
 		QdrantHost:      getEnvOrDefault("QDRANT_HOST", "localhost"),
 		QdrantPort:      getEnvOrDefault("QDRANT_PORT", "6333"),
@@ -44,11 +46,8 @@ func Load() (*Config, error) {
 	if cfg.DatabaseURL == "" {
 		errs = append(errs, "DATABASE_URL is required")
 	}
-	if cfg.AnthropicAPIKey == "" {
-		errs = append(errs, "ANTHROPIC_API_KEY is required")
-	}
-	if cfg.OpenAIAPIKey == "" {
-		errs = append(errs, "OPENAI_API_KEY is required")
+	if cfg.GeminiAPIKey == "" {
+		errs = append(errs, "GEMINI_API_KEY is required")
 	}
 	if len(errs) > 0 {
 		return nil, errors.New(strings.Join(errs, "; "))

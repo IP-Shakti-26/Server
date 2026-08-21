@@ -16,27 +16,27 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Handler holds all dependencies needed by the HTTP handlers. All fields are
-// injected at construction — no global state.
+// Handler holds all injected dependencies for the HTTP layer.
 type Handler struct {
-	cfg    *config.Config
-	pool   *pgxpool.Pool
-	store  *store.Store
-	logger *slog.Logger
+	cfg        *config.Config
+	pool       *pgxpool.Pool
+	store      *store.Store
+	classifier *classifier.Classifier
+	logger     *slog.Logger
 }
 
 // NewHandler constructs a Handler with all required dependencies.
-func NewHandler(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, logger *slog.Logger) *Handler {
+func NewHandler(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, cl *classifier.Classifier, logger *slog.Logger) *Handler {
 	return &Handler{
-		cfg:    cfg,
-		pool:   pool,
-		store:  st,
-		logger: logger,
+		cfg:        cfg,
+		pool:       pool,
+		store:      st,
+		classifier: cl,
+		logger:     logger,
 	}
 }
 
 // HealthHandler handles GET /api/v1/health.
-// Pings Postgres and returns 503 if the database is unreachable.
 func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	if err := store.Ping(r.Context(), h.pool); err != nil {
 		h.logger.Warn("health check: database unreachable", "error", err)
@@ -55,8 +55,6 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // ClassifyHandler handles POST /api/v1/classify.
-// Validates the description, creates or loads a session, runs classification
-// (stub), persists the result, and returns a ClassifyResponse.
 func (h *Handler) ClassifyHandler(w http.ResponseWriter, r *http.Request) {
 	var req ClassifyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -64,7 +62,7 @@ func (h *Handler) ClassifyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Input validation — before any business logic.
+	// Input validation before any business logic.
 	if len(req.Description) < 20 {
 		respond.Error(w, http.StatusBadRequest, "description too short", "min_length", 20)
 		return
@@ -76,7 +74,7 @@ func (h *Handler) ClassifyHandler(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// Create or reuse session.
+	// Create or load session.
 	var sess *store.Session
 	var err error
 	if req.SessionID != "" {
@@ -97,20 +95,26 @@ func (h *Handler) ClassifyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Run classification (stub).
-	result, err := classifier.Classify(ctx, req.Description)
+	// Merge existing clarification answers from session.
+	clarifications := sess.ClarificationAnswers
+	if clarifications == nil {
+		clarifications = map[string]string{}
+	}
+
+	// Run real classification via Gemini.
+	result, err := h.classifier.Classify(ctx, req.Description, clarifications)
 	if err != nil {
 		respond.InternalError(w, err, h.logger)
 		return
 	}
 
-	// Persist classification result.
-	if err := h.store.UpdateClassification(ctx, sess.ID, result); err != nil {
+	// Persist classification. Mark as done ONLY when no clarification is needed.
+	needsClarification := len(result.ClarifyingQuestions) > 0
+	if err := h.store.SaveClassification(ctx, sess.ID, result, !needsClarification); err != nil {
 		respond.InternalError(w, err, h.logger)
 		return
 	}
 
-	needsClarification := len(result.ClarifyingQuestions) > 0
 	questions := result.ClarifyingQuestions
 	if questions == nil {
 		questions = []string{}
@@ -125,15 +129,12 @@ func (h *Handler) ClassifyHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // ClarifyHandler handles POST /api/v1/clarify.
-// Loads the session, appends clarification answers, re-runs classification (stub),
-// and returns the same shape as /classify.
 func (h *Handler) ClarifyHandler(w http.ResponseWriter, r *http.Request) {
 	var req ClarifyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respond.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if req.SessionID == "" {
 		respond.Error(w, http.StatusBadRequest, "session_id is required")
 		return
@@ -159,19 +160,31 @@ func (h *Handler) ClarifyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Re-run classification with the enriched context (stub).
-	result, err := classifier.Classify(ctx, sess.RawDescription)
+	// Reload session to get merged clarification answers.
+	sess, err = h.store.GetSession(ctx, sess.ID)
 	if err != nil {
 		respond.InternalError(w, err, h.logger)
 		return
 	}
 
-	if err := h.store.UpdateClassification(ctx, sess.ID, result); err != nil {
+	clarifications := sess.ClarificationAnswers
+	if clarifications == nil {
+		clarifications = map[string]string{}
+	}
+
+	// Re-run classification with enriched context.
+	result, err := h.classifier.Classify(ctx, sess.RawDescription, clarifications)
+	if err != nil {
 		respond.InternalError(w, err, h.logger)
 		return
 	}
 
 	needsClarification := len(result.ClarifyingQuestions) > 0
+	if err := h.store.SaveClassification(ctx, sess.ID, result, !needsClarification); err != nil {
+		respond.InternalError(w, err, h.logger)
+		return
+	}
+
 	questions := result.ClarifyingQuestions
 	if questions == nil {
 		questions = []string{}
@@ -186,15 +199,12 @@ func (h *Handler) ClarifyHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // AnalyzeHandler handles POST /api/v1/analyze.
-// Loads the session, verifies classification is done, runs the retrieve →
-// synthesize → score pipeline (all stubs), persists and returns the roadmap.
 func (h *Handler) AnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 	var req AnalyzeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respond.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if req.SessionID == "" {
 		respond.Error(w, http.StatusBadRequest, "session_id is required")
 		return
@@ -212,7 +222,7 @@ func (h *Handler) AnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Guard: classification must be complete before analysis.
+	// Guard: classification must be marked done.
 	if !sess.ClassificationDone || sess.Classification == nil {
 		respond.Error(w, http.StatusConflict,
 			"classification not complete",
@@ -221,26 +231,21 @@ func (h *Handler) AnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Retrieve evidence (stub — returns empty slices).
+	// Retrieve → synthesise → score (all stubs for now).
 	evidence, err := retriever.RetrieveForDomains(
-		ctx,
-		sess.RawDescription,
-		sess.Classification.RelevantDomains,
-		"IN",
+		ctx, sess.RawDescription, sess.Classification.RelevantDomains, "IN",
 	)
 	if err != nil {
 		respond.InternalError(w, err, h.logger)
 		return
 	}
 
-	// Synthesise roadmap (stub — returns hardcoded demo data).
 	roadmap, err := synthesizer.Synthesize(ctx, sess.Classification, evidence)
 	if err != nil {
 		respond.InternalError(w, err, h.logger)
 		return
 	}
 
-	// Persist roadmap.
 	if err := h.store.UpdateRoadmap(ctx, sess.ID, roadmap); err != nil {
 		respond.InternalError(w, err, h.logger)
 		return
