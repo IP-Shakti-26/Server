@@ -2,80 +2,275 @@ package synthesizer
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
 
+	"github.com/heythisissud/ip-sakti-backend/internal/classifier"
 	"github.com/heythisissud/ip-sakti-backend/internal/retriever"
 	"github.com/heythisissud/ip-sakti-backend/pkg/domain"
+	"google.golang.org/genai"
 )
 
+const (
+	synthesisModel   = "gemini-2.0-flash"
+	synthesisTimeout = 45 * time.Second
+	maxRawLogLen     = 500
+)
+
+// roadmapDisclaimer is set on every roadmap, unconditionally.
+const roadmapDisclaimer = "This output is for informational purposes only and does not " +
+	"constitute legal advice. IP-SAKTI is not a substitute for a registered patent agent, " +
+	"IP attorney, or legal professional. Consult qualified professionals before taking any " +
+	"formal IP or regulatory action."
+
+// roadmapRaw is the intermediate struct the LLM JSON is unmarshalled into.
+// It maps directly to the schema in the system prompt. The Citation type here
+// only carries ChunkID — the Go code enriches the rest from the evidenceIndex.
+type roadmapRaw struct {
+	ProductSummary    string                    `json:"product_summary"`
+	Classification    string                    `json:"classification"`
+	Domains           []domainAnalysisRaw       `json:"domains"`
+	JurisdictionNotes []domain.JurisdictionNote `json:"jurisdiction_notes"`
+	NextSteps         []string                  `json:"next_steps"`
+	HumanEscalation   []domain.EscalationItem   `json:"human_escalation"`
+	OverallConfidence float64                   `json:"overall_confidence"`
+	Disclaimer        string                    `json:"disclaimer"`
+}
+
+type domainAnalysisRaw struct {
+	Domain          string          `json:"domain"`
+	Status          string          `json:"status"`
+	Finding         string          `json:"finding"`
+	KeyRisks        []string        `json:"key_risks"`
+	Citations       []citationRaw   `json:"citations"`
+	Confidence      float64         `json:"confidence"`
+	NeedsEscalation bool            `json:"needs_escalation"`
+}
+
+// citationRaw captures only the LLM-provided chunk_id. The rest of the fields
+// are populated by Go from the evidenceIndex (Step 7).
+type citationRaw struct {
+	ChunkID string `json:"chunk_id"`
+}
+
+// Synthesizer generates a grounded IPRoadmap from a classification and evidence.
+// It uses Gemini for synthesis, then validates and enriches citations from the
+// actual evidence provided — ensuring no hallucinated chunk IDs survive to output.
+type Synthesizer struct {
+	client *genai.Client
+	logger *slog.Logger
+}
+
+// NewSynthesizer constructs a Synthesizer with the supplied Gemini client.
+// The client is shared with the Classifier — do not create a second one.
+func NewSynthesizer(client *genai.Client, logger *slog.Logger) *Synthesizer {
+	return &Synthesizer{client: client, logger: logger}
+}
+
 // Synthesize generates an IPRoadmap from a classification and retrieved evidence.
-// STUB: returns a hardcoded roadmap for the demo Ashwagandha/Shallaki scenario.
-// Real synthesis via Anthropic Claude is wired in a later deliverable.
-func Synthesize(_ context.Context, _ *domain.ClassificationResult, _ []retriever.RetrievalResult) (*domain.IPRoadmap, error) {
+//
+// Steps:
+//  1. Build evidenceIndex (ground truth for citation validation)
+//  2. Build evidence context string
+//  3. Build user message
+//  4. Call Gemini with 45-second timeout
+//  5. Parse JSON response
+//  6. Validate citations (drop hallucinated IDs, downgrade empty domains)
+//  7. Enrich surviving citations from evidenceIndex
+//  8. Set disclaimer and return
+func (s *Synthesizer) Synthesize(
+	ctx context.Context,
+	classification *classifier.ClassificationResult,
+	evidence []retriever.RetrievalResult,
+) (*domain.IPRoadmap, error) {
+	// ── Step 1: Build evidence index ─────────────────────────────────────────
+	evidenceIndex := make(map[string]retriever.Chunk)
+	totalChunks := 0
+	for _, res := range evidence {
+		for _, chunk := range res.Chunks {
+			evidenceIndex[chunk.ID] = chunk
+			totalChunks++
+		}
+	}
+
+	s.logger.Info("synthesizing roadmap",
+		"domains", len(evidence),
+		"total_chunks", totalChunks,
+		"formulation_type", string(classification.FormulationType),
+	)
+
+	if totalChunks == 0 {
+		s.logger.Warn("empty evidence context",
+			"formulation_type", string(classification.FormulationType),
+		)
+	}
+
+	// ── Step 2: Build evidence context string ─────────────────────────────────
+	evidenceContext := buildEvidenceContext(evidence)
+
+	// ── Step 3: Build user message ───────────────────────────────────────────
+	userMsg := buildSynthesisPrompt(classification, evidenceContext)
+
+	// ── Step 4: Call Gemini ───────────────────────────────────────────────────
+	callCtx, cancel := context.WithTimeout(ctx, synthesisTimeout)
+	defer cancel()
+
+	resp, err := s.client.Models.GenerateContent(
+		callCtx,
+		synthesisModel,
+		genai.Text(userMsg),
+		&genai.GenerateContentConfig{
+			SystemInstruction: &genai.Content{
+				Parts: []*genai.Part{genai.NewPartFromText(synthesisSystemPrompt)},
+			},
+			Temperature:      genai.Ptr(float32(0)),
+			MaxOutputTokens:  3000,
+			ResponseMIMEType: "application/json",
+		},
+	)
+	if err != nil {
+		s.logger.Error("gemini synthesis failed", "error", err)
+		return nil, fmt.Errorf("synthesizer: Gemini API call failed: %w", err)
+	}
+
+	// ── Step 5: Parse response ────────────────────────────────────────────────
+	rawText := resp.Text()
+	if strings.TrimSpace(rawText) == "" {
+		return nil, fmt.Errorf("synthesizer: empty response from Gemini")
+	}
+
+	// Strip accidental markdown fences: find first '{' and last '}'.
+	cleaned := extractJSON(rawText)
+
+	var raw roadmapRaw
+	if err := json.Unmarshal([]byte(cleaned), &raw); err != nil {
+		preview := rawText
+		if len(preview) > maxRawLogLen {
+			preview = preview[:maxRawLogLen]
+		}
+		s.logger.Error("roadmap JSON parse failed",
+			"error", err,
+			"raw_response_preview", preview,
+		)
+		return nil, fmt.Errorf("synthesizer: failed to parse roadmap JSON: %w", err)
+	}
+
+	// Map raw → strongly-typed domain struct.
+	roadmap := mapRawToRoadmap(raw)
+
+	// Validate structure before citation cleaning.
+	if err := validateRoadmapStructure(roadmap); err != nil {
+		s.logger.Error("roadmap structure invalid", "error", err)
+		return nil, err
+	}
+
+	// ── Step 6: Validate citations ────────────────────────────────────────────
+	// This is the critical invariant: every citation in the output must correspond
+	// to a real chunk that was provided in the evidence context.
+	validateAndCleanCitations(roadmap, evidenceIndex, s.logger)
+
+	// ── Step 7: Enrich surviving citations ────────────────────────────────────
+	// The LLM only outputs ChunkID. We populate the rest from the evidenceIndex
+	// so the LLM cannot fabricate doc titles, section numbers, or URLs.
+	for i := range roadmap.Domains {
+		for j := range roadmap.Domains[i].Citations {
+			cit := &roadmap.Domains[i].Citations[j]
+			if chunk, ok := evidenceIndex[cit.ChunkID]; ok {
+				cit.DocTitle    = chunk.DocTitle
+				cit.Section     = chunk.Section
+				cit.SourceURL   = chunk.SourceURL
+				cit.RetrievedAt = chunk.RetrievedAt
+			}
+		}
+	}
+
+	// ── Step 8: Set mandatory fields ──────────────────────────────────────────
+	roadmap.Disclaimer = roadmapDisclaimer
+
+	// ── Log summary ──────────────────────────────────────────────────────────
+	escalationCount := 0
+	for _, d := range roadmap.Domains {
+		if d.NeedsEscalation {
+			escalationCount++
+		}
+	}
+	s.logger.Info("roadmap synthesized",
+		"overall_confidence", roadmap.OverallConfidence,
+		"domains_analyzed", len(roadmap.Domains),
+		"escalations", escalationCount,
+	)
+
+	// ── Step 9: Return ────────────────────────────────────────────────────────
+	return roadmap, nil
+}
+
+// extractJSON strips leading/trailing content outside the outermost { } braces.
+// Handles the case where Gemini wraps its JSON in a markdown code fence despite
+// instructions not to.
+func extractJSON(s string) string {
+	first := strings.Index(s, "{")
+	last := strings.LastIndex(s, "}")
+	if first == -1 || last == -1 || last < first {
+		return s
+	}
+	return s[first : last+1]
+}
+
+// mapRawToRoadmap converts the intermediate raw parsed struct to the strongly-typed
+// domain.IPRoadmap. Citation fields other than ChunkID are left empty here — they
+// are populated in Step 7 from the evidenceIndex.
+func mapRawToRoadmap(raw roadmapRaw) *domain.IPRoadmap {
+	domains := make([]domain.DomainAnalysis, 0, len(raw.Domains))
+	for _, rd := range raw.Domains {
+		citations := make([]domain.Citation, 0, len(rd.Citations))
+		for _, rc := range rd.Citations {
+			citations = append(citations, domain.Citation{
+				ChunkID: rc.ChunkID,
+			})
+		}
+
+		keyRisks := rd.KeyRisks
+		if keyRisks == nil {
+			keyRisks = []string{}
+		}
+
+		domains = append(domains, domain.DomainAnalysis{
+			Domain:          domain.Domain(rd.Domain),
+			Status:          domain.DomainStatus(rd.Status),
+			Finding:         rd.Finding,
+			KeyRisks:        keyRisks,
+			Citations:       citations,
+			Confidence:      rd.Confidence,
+			NeedsEscalation: rd.NeedsEscalation,
+		})
+	}
+
+	nextSteps := raw.NextSteps
+	if nextSteps == nil {
+		nextSteps = []string{}
+	}
+
+	humanEscalation := raw.HumanEscalation
+	if humanEscalation == nil {
+		humanEscalation = []domain.EscalationItem{}
+	}
+
+	jurisdictionNotes := raw.JurisdictionNotes
+	if jurisdictionNotes == nil {
+		jurisdictionNotes = []domain.JurisdictionNote{}
+	}
+
 	return &domain.IPRoadmap{
-		ProductSummary: "Proprietary Ayurvedic joint-pain formulation combining Ashwagandha " +
-			"(Withania somnifera) and Shallaki (Boswellia serrata) sourced from India, " +
-			"intended for sale in India and Germany.",
-		Classification: "Proprietary Ayurvedic formulation with Indian bio-resources and " +
-			"traditional knowledge involvement.",
-		Domains: []domain.DomainAnalysis{
-			{
-				Domain:  domain.DomainPatent,
-				Status:  domain.StatusRelevant,
-				Finding: "Your formulation combines Ashwagandha and Shallaki in a novel ratio for joint-pain relief. While individual ingredient use is in the public domain, a specific synergistic formulation with defined extract ratios may qualify for patent protection in India under the Patents Act 1970. PCT filing will be required for Germany market entry.",
-				KeyRisks: []string{
-					"Prior art risk: TKDL (Traditional Knowledge Digital Library) may have overlapping formulations.",
-					"Novelty of combination must be demonstrable over classical Ayurvedic texts.",
-					"German patent office requires clinical evidence for health claims.",
-				},
-				Citations:       []domain.Citation{},
-				Confidence:      0.78,
-				NeedsEscalation: false,
-			},
-			{
-				Domain:  domain.DomainABS,
-				Status:  domain.StatusRelevant,
-				Finding: "Both Ashwagandha and Shallaki are Indian biological resources. Accessing and commercialising these resources triggers obligations under India's Biological Diversity Act 2002 and the Nagoya Protocol (for Germany, an EU signatory). ABS compliance requires filing with the National Biodiversity Authority (NBA) before commercial exploitation.",
-				KeyRisks: []string{
-					"Non-compliance with Biological Diversity Act is a criminal offence.",
-					"EU regulations require a due-diligence declaration under the Nagoya Protocol for German sales.",
-					"Failure to obtain NBA approval before commercialisation can result in product ban.",
-				},
-				Citations:       []domain.Citation{},
-				Confidence:      0.91,
-				NeedsEscalation: true,
-			},
-			{
-				Domain:  domain.DomainRegulatory,
-				Status:  domain.StatusRelevant,
-				Finding: "In India, a proprietary Ayurvedic formulation requires a manufacturing licence under Schedule T of the Drugs & Cosmetics Act and must be labelled per AYUSH guidelines. For Germany, the formulation will be regulated as a Traditional Herbal Medicinal Product (THMP) under EU Directive 2004/24/EC, requiring a simplified registration with 30 years of traditional use evidence (15 years in the EU).",
-				KeyRisks: []string{
-					"Proprietary name must not imply a cure for a scheduled disease without clinical trials.",
-					"EU THMP registration is lengthy (18–24 months); early regulatory strategy is advised.",
-					"Labelling in Germany must comply with BfArM requirements in German language.",
-				},
-				Citations:       []domain.Citation{},
-				Confidence:      0.85,
-				NeedsEscalation: false,
-			},
-		},
-		NextSteps: []string{
-			"File an NBA Access and Benefit Sharing (ABS) disclosure with the National Biodiversity Authority before any commercial activity, to avoid penalties under the Biological Diversity Act 2002.",
-			"Commission a TKDL freedom-to-operate search and a patent novelty search (India + PCT) to assess patentability of your specific formulation ratios before investment in clinical trials.",
-			"Engage an AYUSH-registered consultant to prepare the Drug Master File and apply for a manufacturing licence under Schedule T of the Drugs & Cosmetics Act.",
-		},
-		HumanEscalation: []domain.EscalationItem{
-			{
-				Reason:   "Biodiversity Act compliance and NBA ABS filing involve regulatory penalties if mishandled. An expert review is strongly recommended before commercial launch.",
-				ProfType: "Biodiversity/ABS Legal Specialist",
-				Urgency:  "high",
-			},
-			{
-				Reason:   "German THMP registration under EU Directive 2004/24/EC is a complex multi-year process requiring a qualified person (QP) and regulatory affairs specialist familiar with BfArM procedures.",
-				ProfType: "EU Regulatory Affairs Consultant",
-				Urgency:  "medium",
-			},
-		},
-		OverallConfidence: 0.74,
-		Disclaimer:        "This analysis is generated by an AI system and is provided for informational purposes only. It does not constitute legal advice, regulatory guidance, or a professional opinion. Always consult a qualified IP attorney, regulatory consultant, or legal professional before making commercial decisions.",
-	}, nil
+		ProductSummary:    raw.ProductSummary,
+		Classification:    raw.Classification,
+		Domains:           domains,
+		JurisdictionNotes: jurisdictionNotes,
+		NextSteps:         nextSteps,
+		HumanEscalation:   humanEscalation,
+		OverallConfidence: raw.OverallConfidence,
+		// Disclaimer is set in Step 8 unconditionally.
+	}
 }

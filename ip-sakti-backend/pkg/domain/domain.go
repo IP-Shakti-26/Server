@@ -89,17 +89,26 @@ type EscalationItem struct {
 	Urgency  string `json:"urgency"`
 }
 
+// ── Jurisdiction notes ────────────────────────────────────────────────────────
+
+// JurisdictionNote captures cross-border regulatory or IP considerations for
+// a specific target market that falls outside the primary India analysis.
+type JurisdictionNote struct {
+	Market                 string `json:"market"`
+	Note                   string `json:"note"`
+	RequiresSeparateAnalysis bool   `json:"requires_separate_analysis"`
+}
+
 // ── Roadmap ───────────────────────────────────────────────────────────────────
 
 // IPRoadmap is the synthesised IP strategy delivered to the user.
 type IPRoadmap struct {
-	ProductSummary    string           `json:"product_summary"`
-	Classification    string           `json:"classification"`
-	Domains           []DomainAnalysis `json:"domains"`
-	NextSteps         []string         `json:"next_steps"`
-	HumanEscalation   []EscalationItem `json:"human_escalation"`
-	OverallConfidence float64          `json:"overall_confidence"`
-	Disclaimer        string           `json:"disclaimer"`
+	ProductSummary    string             `json:"product_summary"`
+	Classification    string             `json:"classification"`
+	Domains           []DomainAnalysis   `json:"domains"`
+	JurisdictionNotes []JurisdictionNote `json:"jurisdiction_notes"`
+	NextSteps         []string           `json:"next_steps"`
+	HumanEscalation   []EscalationItem   `json:"human_escalation"`
+	OverallConfidence float64            `json:"overall_confidence"`
+	Disclaimer        string             `json:"disclaimer"`
 }
-
-

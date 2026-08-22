@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -18,23 +19,25 @@ import (
 
 // Handler holds all injected dependencies for the HTTP layer.
 type Handler struct {
-	cfg        *config.Config
-	pool       *pgxpool.Pool
-	store      *store.Store
-	classifier *classifier.Classifier
-	retriever  *retriever.Retriever
-	logger     *slog.Logger
+	cfg         *config.Config
+	pool        *pgxpool.Pool
+	store       *store.Store
+	classifier  *classifier.Classifier
+	retriever   *retriever.Retriever
+	synthesizer *synthesizer.Synthesizer
+	logger      *slog.Logger
 }
 
 // NewHandler constructs a Handler with all required dependencies.
-func NewHandler(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, cl *classifier.Classifier, ret *retriever.Retriever, logger *slog.Logger) *Handler {
+func NewHandler(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, cl *classifier.Classifier, ret *retriever.Retriever, syn *synthesizer.Synthesizer, logger *slog.Logger) *Handler {
 	return &Handler{
-		cfg:        cfg,
-		pool:       pool,
-		store:      st,
-		classifier: cl,
-		retriever:  ret,
-		logger:     logger,
+		cfg:         cfg,
+		pool:        pool,
+		store:       st,
+		classifier:  cl,
+		retriever:   ret,
+		synthesizer: syn,
+		logger:      logger,
 	}
 }
 
@@ -264,17 +267,31 @@ func (h *Handler) AnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
-	roadmap, err := synthesizer.Synthesize(ctx, sess.Classification, evidence)
+	// Step 6 — Synthesize the roadmap via Gemini.
+	roadmap, err := h.synthesizer.Synthesize(ctx, sess.Classification, evidence)
 	if err != nil {
+		// Check specifically for synthesis timeout — return 504, not 500.
+		if errors.Is(err, context.DeadlineExceeded) {
+			h.logger.Error("synthesis timed out", "session_id", req.SessionID, "error", err)
+			respond.Error(w, http.StatusGatewayTimeout, "synthesis timed out", "hint", "retry the request")
+			return
+		}
+		h.logger.Error("gemini synthesis failed", "session_id", req.SessionID, "error", err)
 		respond.InternalError(w, err, h.logger)
 		return
 	}
 
+	// Step 7 — Persist roadmap. This is best-effort: if the DB write fails,
+	// the roadmap is still returned to the client. Log at ERROR but do not 500.
 	if err := h.store.UpdateRoadmap(ctx, sess.ID, roadmap); err != nil {
-		respond.InternalError(w, err, h.logger)
-		return
+		h.logger.Error("failed to persist roadmap",
+			"session_id", req.SessionID,
+			"error", err,
+		)
+		// Intentionally continue — do not fail the request.
 	}
 
+	// Step 8 — Respond.
 	respond.JSON(w, http.StatusOK, AnalyzeResponse{
 		SessionID:   sess.ID,
 		Roadmap:     roadmap,

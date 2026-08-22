@@ -14,6 +14,7 @@ import (
 	"github.com/heythisissud/ip-sakti-backend/internal/classifier"
 	"github.com/heythisissud/ip-sakti-backend/internal/retriever"
 	"github.com/heythisissud/ip-sakti-backend/internal/store"
+	"github.com/heythisissud/ip-sakti-backend/internal/synthesizer"
 	"github.com/heythisissud/ip-sakti-backend/pkg/config"
 	qdrantpb "github.com/qdrant/go-client/qdrant"
 	"google.golang.org/genai"
@@ -87,7 +88,8 @@ func main() {
 	// ── Dependency injection ──────────────────────────────────────────────
 	st := store.NewStore(pool)
 	cl := classifier.NewClassifier(geminiClient, logger)
-	h := api.NewHandler(cfg, pool, st, cl, ret, logger)
+	syn := synthesizer.NewSynthesizer(geminiClient, logger) // shares geminiClient with classifier
+	h := api.NewHandler(cfg, pool, st, cl, ret, syn, logger)
 	router := api.NewRouter(h, cfg, logger)
 
 	// ── HTTP server ───────────────────────────────────────────────────────
