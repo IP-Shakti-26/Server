@@ -4,11 +4,12 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "extract": "ts-node src/extract.ts",
-    "chunk": "ts-node src/chunk.ts",
-    "upload": "ts-node src/embed_upload.ts",
-    "verify": "ts-node src/verify.ts",
-    "test-retrieval": "ts-node src/retrieval_test.ts"
+    "extract": "tsx src/extract.ts",
+    "chunk": "npx tsc --ignoreConfig --outDir dist --module commonjs --target ES2022 --esModuleInterop true --skipLibCheck true --types node src/chunk.ts src/types.ts src/manifest.ts && node dist/chunk.js",
+    "upload": "tsx src/embed_upload.ts",
+    "verify": "tsx src/verify.ts",
+    "test-retrieval": "tsx src/retrieval_test.ts",
+    "answer": "tsx src/answer.ts"
   },
   "keywords": [],
   "author": "",
@@ -20,7 +21,13 @@
     "@types/pdf-parse": "^1.1.5",
     "dotenv": "^17.4.2",
     "pdf-parse": "^2.4.5",
+    "pdfjs-dist": "^6.2.108",
+    "stream-json": "^3.5.0",
     "ts-node": "^10.9.2",
     "typescript": "^7.0.2"
+  },
+  "devDependencies": {
+    "cross-env": "^10.1.0",
+    "tsx": "^4.23.12"
   }
 }

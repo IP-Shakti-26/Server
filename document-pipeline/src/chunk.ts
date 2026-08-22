@@ -1,6 +1,6 @@
 import fs from "fs";
 import path from "path";
-import { Chunk, ExtractedDocument } from "./types";
+import { Chunk } from "./types";
 import { CORPUS_MANIFEST } from "./manifest";
 
 // ─── Paths ────────────────────────────────────────────────────────────────────
@@ -8,64 +8,63 @@ import { CORPUS_MANIFEST } from "./manifest";
 const EXTRACTED_DIR = path.resolve(__dirname, "../extracted");
 const CHUNKS_DIR    = path.resolve(__dirname, "../chunks");
 
-// ─── Chunking Parameters ─────────────────────────────────────────────────────
+// ─── Chunking Parameters ──────────────────────────────────────────────────────
 
-const TARGET_CHARS  = 3200;   // ≈ 800 tokens
-const OVERLAP_CHARS = 400;    // ≈ 100 token overlap
-const MIN_CHUNK     = 100;    // discard tiny trailing fragments
+const TARGET_CHARS  = 3200;  // ≈ 800 tokens
+const OVERLAP_CHARS = 400;   // ≈ 100-token overlap
+const MIN_CHUNK     = 100;   // discard tiny trailing fragments
 
 // ─── Section Detection ────────────────────────────────────────────────────────
 
 const SECTION_PATTERNS: RegExp[] = [
-  /Section\s+\d+[A-Za-z]?\([a-z]\)/,   // e.g. "Section 3(p)"
-  /Section\s+\d+[A-Za-z]?/,            // e.g. "Section 12A"
-  /Rule\s+\d+/,                         // e.g. "Rule 7"
-  /Chapter\s+[IVXLC\d]+/,              // e.g. "Chapter IV"
-  /Article\s+\d+/,                      // e.g. "Article 27"
-  /Schedule\s+[IVXLC\d]+/,             // e.g. "Schedule III"
+  /Section\s+\d+[A-Za-z]?\([a-z]\)/,
+  /Section\s+\d+[A-Za-z]?/,
+  /Rule\s+\d+/,
+  /Chapter\s+[IVXLC\d]+/,
+  /Article\s+\d+/,
+  /Schedule\s+[IVXLC\d]+/,
 ];
 
 function detectSectionRef(text: string): string {
   const head = text.slice(0, 300);
-  for (const pattern of SECTION_PATTERNS) {
-    const match = head.match(pattern);
-    if (match) return match[0];
+  for (const pat of SECTION_PATTERNS) {
+    const m = head.match(pat);
+    if (m) return m[0];
   }
   return "unknown";
 }
 
-// ─── Chunker ──────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function ensureDir(dir: string): void {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+// ─── Core Chunker ─────────────────────────────────────────────────────────────
+// Takes a flat string and produces chunk objects. No memory surprise here.
 
 function chunkText(fullText: string, stem: string): Chunk[] {
-  const meta = CORPUS_MANIFEST[`${stem}.pdf`];
+  const meta   = CORPUS_MANIFEST[`${stem}.pdf`];
   const chunks: Chunk[] = [];
-
   let start = 0;
-  let index = 0;
+  let idx   = 0;
 
   while (start < fullText.length) {
-    // Candidate end = start + target window
     let end = Math.min(start + TARGET_CHARS, fullText.length);
 
-    // Try to break on a paragraph boundary within the second half of the window
+    // Snap to paragraph boundary in the second half of the window
     if (end < fullText.length) {
-      const midpoint  = start + Math.floor(TARGET_CHARS / 2);
-      const searchSlice = fullText.slice(midpoint, end);
-      const lastBreak   = searchSlice.lastIndexOf("\n\n");
-
-      if (lastBreak !== -1) {
-        // Snap end to the paragraph break (keep the double newline in current chunk)
-        end = midpoint + lastBreak + 2;
-      }
+      const mid   = start + Math.floor(TARGET_CHARS / 2);
+      const slice = fullText.slice(mid, end);
+      const brk   = slice.lastIndexOf("\n\n");
+      if (brk !== -1) end = mid + brk + 2;
     }
 
     const text = fullText.slice(start, end).trim();
 
     if (text.length >= MIN_CHUNK) {
-      const chunk_id = `${stem}_chunk_${String(index).padStart(4, "0")}`;
-
       chunks.push({
-        chunk_id,
+        chunk_id:    `${stem}_chunk_${String(idx).padStart(4, "0")}`,
         text,
         doc_title:    meta.doc_title,
         domain:       meta.domain,
@@ -77,37 +76,46 @@ function chunkText(fullText: string, stem: string): Chunk[] {
         char_start:   start,
         char_end:     start + text.length,
       });
-
-      index++;
+      idx++;
     }
 
-    // Advance with overlap so context bleeds across chunks
-    start = end - OVERLAP_CHARS;
-
-    // Safety guard: if we didn't advance, force forward to avoid infinite loop
-    if (start <= (end - TARGET_CHARS - 1)) {
-      start = end;
-    }
+    // Advance — guaranteed forward progress
+    const next = end - OVERLAP_CHARS;
+    start = next > start ? next : end;
   }
 
   return chunks;
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Process One File ─────────────────────────────────────────────────────────
 
-function ensureDir(dir: string): void {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
+function processFile(jsonFile: string): number {
+  const stem        = path.basename(jsonFile, ".json");
+  const inPath      = path.join(EXTRACTED_DIR, jsonFile);
+  const outPath     = path.join(CHUNKS_DIR, `${stem}_chunks.json`);
 
-function buildFullText(doc: ExtractedDocument): string {
-  return doc.pages
-    .map((p) => `[Page ${p.page_num}]\n${p.text}`)
-    .join("\n\n");
+  // Read & parse — 1-2 MB files are fine for JSON.parse
+  // eslint-disable-next-line prefer-const
+  let raw  = JSON.parse(fs.readFileSync(inPath, "utf-8")) as {
+    pages: { page_num: number; text: string }[];
+  };
+
+  // Build full text — free raw immediately after
+  const fullText = raw.pages.map((p) => `[Page ${p.page_num}]\n${p.text}`).join("\n\n");
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (raw as any) = null;
+
+  const chunks = chunkText(fullText, stem);
+
+  // Write chunks as JSON
+  fs.writeFileSync(outPath, JSON.stringify(chunks, null, 2), "utf-8");
+
+  return chunks.length;
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-async function main(): Promise<void> {
+function main(): void {
   ensureDir(CHUNKS_DIR);
 
   const jsonFiles = fs
@@ -115,48 +123,35 @@ async function main(): Promise<void> {
     .filter((f) => f.endsWith(".json"));
 
   if (jsonFiles.length === 0) {
-    console.error(
-      `[ERROR] No JSON files found in ${EXTRACTED_DIR}.\n` +
-      `Run "npm run extract" first.`
-    );
+    console.error(`[ERROR] No JSON files in ${EXTRACTED_DIR}. Run "npm run extract" first.`);
     process.exit(1);
   }
 
-  console.log(`\nChunking ${jsonFiles.length} extracted file(s)\n${"─".repeat(50)}`);
+  console.log(`\nChunking ${jsonFiles.length} file(s)\n${"─".repeat(50)}`);
 
-  let totalChunks = 0;
+  let total = 0;
 
   for (const jsonFile of jsonFiles) {
-    const stem         = path.basename(jsonFile, ".json");
-    const manifestKey  = `${stem}.pdf`;
+    const stem        = path.basename(jsonFile, ".json");
+    const manifestKey = `${stem}.pdf`;
 
-    // ── Manifest guard ─────────────────────────────────────────────────────
     if (!CORPUS_MANIFEST[manifestKey]) {
-      console.warn(
-        `  ⚠  WARNING: "${manifestKey}" not found in CORPUS_MANIFEST — skipping.`
-      );
+      console.warn(`  ⚠  "${manifestKey}" not in CORPUS_MANIFEST — skipping.`);
       continue;
     }
 
-    const inPath  = path.join(EXTRACTED_DIR, jsonFile);
-    const outPath = path.join(CHUNKS_DIR, `${stem}_chunks.json`);
+    console.log(`\nProcessing: ${jsonFile}`);
 
     try {
-      const raw: ExtractedDocument = JSON.parse(fs.readFileSync(inPath, "utf-8"));
-      const fullText = buildFullText(raw);
-      const chunks   = chunkText(fullText, stem);
-
-      fs.writeFileSync(outPath, JSON.stringify(chunks, null, 2), "utf-8");
-
-      console.log(`  ${jsonFile}: ${chunks.length} chunks  →  ${outPath}`);
-      totalChunks += chunks.length;
+      const count = processFile(jsonFile);
+      console.log(`  → ${count} chunks written`);
+      total += count;
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`  [ERROR] Failed to chunk "${jsonFile}": ${message}`);
+      console.error(`  [ERROR] ${err instanceof Error ? err.message : err}`);
     }
   }
 
-  console.log(`\n${"─".repeat(50)}\nTotal chunks across corpus: ${totalChunks}\n`);
+  console.log(`\n${"─".repeat(50)}\nTotal chunks: ${total}\n`);
 }
 
 main();

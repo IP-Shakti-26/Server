@@ -9,7 +9,7 @@ const GEMINI_API_KEY  = process.env.GEMINI_API_KEY  ?? "";
 const QDRANT_URL      = process.env.QDRANT_URL       ?? "http://localhost:6333";
 const COLLECTION_NAME = process.env.COLLECTION_NAME  ?? "ipsakti_docs";
 
-const EMBEDDING_MODEL = "text-embedding-004";
+const EMBEDDING_MODEL = "gemini-embedding-2";
 
 if (!GEMINI_API_KEY) {
   console.error("[ERROR] GEMINI_API_KEY is not set in .env");

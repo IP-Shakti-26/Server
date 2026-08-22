@@ -11,11 +11,11 @@ const GEMINI_API_KEY   = process.env.GEMINI_API_KEY   ?? "";
 const QDRANT_URL       = process.env.QDRANT_URL        ?? "http://localhost:6333";
 const COLLECTION_NAME  = process.env.COLLECTION_NAME   ?? "ipsakti_docs";
 
-const EMBEDDING_MODEL  = "text-embedding-004"; // Gemini embedding model
-const VECTOR_SIZE      = 768;                  // text-embedding-004 output dim
-const BATCH_SIZE       = 50;
-const BATCH_DELAY_MS   = 200;
-const RETRY_DELAY_MS   = 10_000;
+const EMBEDDING_MODEL  = "gemini-embedding-2"; // Gemini embedding model
+const VECTOR_SIZE      = 3072;                 // gemini-embedding-2 output dim
+const BATCH_SIZE       = 50;                   // batch size for upsert and embed
+const BATCH_DELAY_MS   = 5000;                 // delay between batches
+const RETRY_DELAY_MS   = 30_000;               // retry delay on error
 
 const CHUNKS_DIR = path.resolve(__dirname, "../chunks");
 
@@ -61,28 +61,43 @@ async function ensureCollection(): Promise<void> {
   console.log(`✓ Created collection "${COLLECTION_NAME}" (size=${VECTOR_SIZE}, Cosine)`);
 }
 
-// ─── Embedding ────────────────────────────────────────────────────────────────
+// gemini-embedding-2 accepts up to 2048 tokens ≈ ~8000 chars; truncate to be safe
+const MAX_EMBED_CHARS = 7500;
 
 async function embedBatch(texts: string[]): Promise<number[][]> {
   const model = genAI.getGenerativeModel({ model: EMBEDDING_MODEL });
 
   const attempt = async (): Promise<number[][]> => {
-    const results: number[][] = [];
-    for (const text of texts) {
-      const res = await model.embedContent(text);
-      results.push(res.embedding.values);
-    }
-    return results;
+    const reqs = texts.map((t) => ({
+      model: `models/${EMBEDDING_MODEL}`,
+      content: {
+        parts: [{ text: t.length > MAX_EMBED_CHARS ? t.slice(0, MAX_EMBED_CHARS) : t }],
+      },
+    }));
+
+    const res = await model.batchEmbedContents({ requests: reqs });
+    return res.embeddings.map((e) => e.values);
   };
 
-  try {
-    return await attempt();
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`  ⚠  Embedding error: ${msg}. Retrying in ${RETRY_DELAY_MS / 1000}s…`);
-    await sleep(RETRY_DELAY_MS);
-    return await attempt(); // throws if it fails again — caller handles it
+  let lastErr: unknown;
+  for (let attemptNum = 0; attemptNum < 3; attemptNum++) {
+    try {
+      return await attempt();
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      const isDailyQuota = msg.toLowerCase().includes("quota") || msg.toLowerCase().includes("exceeded your current quota");
+      if (isDailyQuota) {
+        console.error(`\n[FATAL] Gemini API Daily Quota Exceeded. Please wait for reset (PST midnight / 1:30 PM IST) or use a different API key.`);
+        process.exit(1);
+      }
+      const wait = msg.includes("429") ? RETRY_DELAY_MS : 5_000;
+      console.warn(`  ⚠  Batch embed error (attempt ${attemptNum + 1}): ${msg.slice(0, 120)}. Waiting ${wait / 1000}s…`);
+      await sleep(wait);
+    }
   }
+
+  throw lastErr;
 }
 
 // ─── Upload ───────────────────────────────────────────────────────────────────
@@ -154,6 +169,35 @@ function loadAllChunks(): Chunk[] {
   return allChunks;
 }
 
+async function getExistingChunkIds(): Promise<Set<string>> {
+  console.log(`Checking existing points in Qdrant collection "${COLLECTION_NAME}"...`);
+  const existingIds = new Set<string>();
+  let offset: string | number | null | undefined = undefined;
+
+  while (true) {
+    const res = await qdrant.scroll(COLLECTION_NAME, {
+      limit: 1000,
+      with_payload: ["chunk_id"],
+      with_vector: false,
+      offset: offset ?? undefined,
+    });
+
+    for (const point of res.points) {
+      const payload = point.payload as any;
+      if (payload && typeof payload.chunk_id === "string") {
+        existingIds.add(payload.chunk_id);
+      }
+    }
+
+    if (!res.next_page_offset) {
+      break;
+    }
+    offset = res.next_page_offset;
+  }
+
+  return existingIds;
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -170,14 +214,27 @@ async function main(): Promise<void> {
     // 2. Load all chunks from disk
     console.log("\nLoading chunks from chunks/…");
     const allChunks = loadAllChunks();
-    console.log(`\nTotal chunks to embed & upload: ${allChunks.length}`);
+    console.log(`\nTotal chunks loaded: ${allChunks.length}`);
 
-    // 3. Embed + upload in batches
+    // 3. Get already uploaded chunks
+    const existingChunkIds = await getExistingChunkIds();
+    console.log(`Found ${existingChunkIds.size} chunks already uploaded.`);
+
+    const chunksToUpload = allChunks.filter((c) => !existingChunkIds.has(c.chunk_id));
+    console.log(`Remaining chunks to embed & upload: ${chunksToUpload.length}`);
+
+    if (chunksToUpload.length === 0) {
+      console.log(`\n✓ All chunks are already uploaded! Nothing to do.`);
+      console.log(`\n${"─".repeat(50)}\n`);
+      return;
+    }
+
+    // 4. Embed + upload in batches
     console.log(`\nUploading in batches of ${BATCH_SIZE}…\n`);
-    await uploadChunks(allChunks);
+    await uploadChunks(chunksToUpload);
 
     console.log(`\n${"─".repeat(50)}`);
-    console.log(`✓ Done. ${allChunks.length} points upserted to "${COLLECTION_NAME}".`);
+    console.log(`✓ Done. ${chunksToUpload.length} points upserted to "${COLLECTION_NAME}".`);
     console.log(`${"─".repeat(50)}\n`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
