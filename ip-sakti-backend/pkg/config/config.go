@@ -16,7 +16,8 @@ type Config struct {
 	GeminiAPIKey    string   // GEMINI_API_KEY, required
 	AnthropicAPIKey string   // ANTHROPIC_API_KEY, optional (future)
 	QdrantHost      string
-	QdrantPort      string
+	QdrantPort      string   // HTTP REST port, default 6333
+	QdrantGRPCPort  string   // gRPC port, default 6334
 	QdrantAPIKey    string
 	OpenAIAPIKey    string   // OPENAI_API_KEY, optional (for embeddings, future)
 	Env             string
@@ -36,6 +37,7 @@ func Load() (*Config, error) {
 		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
 		QdrantHost:      getEnvOrDefault("QDRANT_HOST", "localhost"),
 		QdrantPort:      getEnvOrDefault("QDRANT_PORT", "6333"),
+		QdrantGRPCPort:  getEnvOrDefault("QDRANT_GRPC_PORT", "6334"),
 		QdrantAPIKey:    os.Getenv("QDRANT_API_KEY"),
 		OpenAIAPIKey:    os.Getenv("OPENAI_API_KEY"),
 		Env:             getEnvOrDefault("APP_ENV", "development"),

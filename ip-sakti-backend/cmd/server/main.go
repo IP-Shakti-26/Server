@@ -12,9 +12,13 @@ import (
 
 	"github.com/heythisissud/ip-sakti-backend/internal/api"
 	"github.com/heythisissud/ip-sakti-backend/internal/classifier"
+	"github.com/heythisissud/ip-sakti-backend/internal/retriever"
 	"github.com/heythisissud/ip-sakti-backend/internal/store"
 	"github.com/heythisissud/ip-sakti-backend/pkg/config"
+	qdrantpb "github.com/qdrant/go-client/qdrant"
 	"google.golang.org/genai"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func main() {
@@ -43,7 +47,7 @@ func main() {
 	defer pool.Close()
 	logger.Info("database connected")
 
-	// ── Gemini client ─────────────────────────────────────────────────────
+	// ── Gemini client (used by classifier) ───────────────────────────────
 	geminiClient, err := genai.NewClient(context.Background(), &genai.ClientConfig{
 		APIKey:  cfg.GeminiAPIKey,
 		Backend: genai.BackendGeminiAPI,
@@ -54,10 +58,36 @@ func main() {
 	}
 	logger.Info("Gemini client initialised")
 
+	// ── Qdrant gRPC client ────────────────────────────────────────────────
+	// Connection failure here is fatal: a retriever without Qdrant is useless.
+	qdrantAddr := cfg.QdrantHost + ":" + cfg.QdrantGRPCPort
+	qdrantConn, err := grpc.NewClient(qdrantAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		logger.Error("failed to connect to Qdrant", "addr", qdrantAddr, "error", err)
+		os.Exit(1)
+	}
+	defer qdrantConn.Close()
+	qdrantClient := qdrantpb.NewPointsClient(qdrantConn)
+	logger.Info("Qdrant client initialised", "addr", qdrantAddr)
+
+	// ── Embedder (text-embedding-004 via Google AI) ───────────────────────
+	embedder, err := retriever.NewEmbedder(cfg.GeminiAPIKey, logger)
+	if err != nil {
+		logger.Error("failed to create embedder", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("embedder initialised")
+
+	// ── Retriever ─────────────────────────────────────────────────────────
+	// cfg.QdrantAPIKey is "" for local Qdrant; non-empty for Qdrant Cloud.
+	ret := retriever.NewRetriever(qdrantClient, embedder, cfg.QdrantAPIKey, logger)
+
 	// ── Dependency injection ──────────────────────────────────────────────
 	st := store.NewStore(pool)
 	cl := classifier.NewClassifier(geminiClient, logger)
-	h := api.NewHandler(cfg, pool, st, cl, logger)
+	h := api.NewHandler(cfg, pool, st, cl, ret, logger)
 	router := api.NewRouter(h, cfg, logger)
 
 	// ── HTTP server ───────────────────────────────────────────────────────
@@ -98,3 +128,4 @@ func main() {
 	}
 	logger.Info("server stopped gracefully")
 }
+

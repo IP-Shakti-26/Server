@@ -22,16 +22,18 @@ type Handler struct {
 	pool       *pgxpool.Pool
 	store      *store.Store
 	classifier *classifier.Classifier
+	retriever  *retriever.Retriever
 	logger     *slog.Logger
 }
 
 // NewHandler constructs a Handler with all required dependencies.
-func NewHandler(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, cl *classifier.Classifier, logger *slog.Logger) *Handler {
+func NewHandler(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, cl *classifier.Classifier, ret *retriever.Retriever, logger *slog.Logger) *Handler {
 	return &Handler{
 		cfg:        cfg,
 		pool:       pool,
 		store:      st,
 		classifier: cl,
+		retriever:  ret,
 		logger:     logger,
 	}
 }
@@ -231,13 +233,35 @@ func (h *Handler) AnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Retrieve → synthesise → score (all stubs for now).
-	evidence, err := retriever.RetrieveForDomains(
-		ctx, sess.RawDescription, sess.Classification.RelevantDomains, "IN",
-	)
+	// Step 4 — Build retrieval request.
+	// Convert []domain.Domain to []string for the retriever.
+	domainStrs := make([]string, len(sess.Classification.RelevantDomains))
+	for i, d := range sess.Classification.RelevantDomains {
+		domainStrs[i] = string(d)
+	}
+
+	// Step 5 — Retrieve evidence from Qdrant.
+	// Partial failure is tolerated: one domain failing does not abort the call.
+	evidence, err := h.retriever.RetrieveForDomains(ctx, retriever.RetrieveRequest{
+		BaseQuery:    sess.Classification.RawDescription,
+		Domains:      domainStrs,
+		Jurisdiction: "india",
+		TopK:         5,
+	})
 	if err != nil {
+		// RetrieveForDomains only returns a non-nil error for catastrophic failures;
+		// per-domain errors are logged and swallowed inside the method.
 		respond.InternalError(w, err, h.logger)
 		return
+	}
+
+	// Step 6 — Log retrieval counts per domain at INFO level.
+	for _, result := range evidence {
+		h.logger.Info("retrieved evidence",
+			"domain", result.Domain,
+			"chunks", len(result.Chunks),
+			"session_id", req.SessionID,
+		)
 	}
 
 	roadmap, err := synthesizer.Synthesize(ctx, sess.Classification, evidence)

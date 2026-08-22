@@ -1,34 +1,311 @@
+// Package retriever implements domain-filtered, authority-weighted retrieval
+// from Qdrant for the IP-SAKTI pipeline. It is the evidence engine for /analyze.
 package retriever
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
+	"sort"
+	"strconv"
+	"sync"
+	"time"
 
-	"github.com/heythisissud/ip-sakti-backend/pkg/domain"
+	qdrantpb "github.com/qdrant/go-client/qdrant"
+	"google.golang.org/grpc/metadata"
 )
 
-// Chunk is a unit of text retrieved from the vector store.
-type Chunk struct {
-	ID      string
-	Content string
-	Score   float64
+// qdrantCollection is the single Qdrant collection that stores all IP-SAKTI
+// document chunks. All domains share one collection; domain filtering is done
+// via Qdrant payload filters.
+const qdrantCollection = "ipsakti_chunks"
+
+// domainOrder defines consistent output ordering for []RetrievalResult.
+// Synthesizer expects a stable domain order for structured output generation.
+var domainOrder = map[string]int{
+	"patent":                0,
+	"traditional_knowledge": 1,
+	"biodiversity_abs":      2,
+	"regulatory":            3,
+	"trademark":             4,
 }
 
-// RetrievalResult groups retrieved chunks for a specific domain.
-type RetrievalResult struct {
-	Domain domain.Domain
-	Chunks []Chunk
+// Retriever is the evidence engine. It embeds a query, filters by domain and
+// jurisdiction in Qdrant, and reranks by legal authority.
+type Retriever struct {
+	qdrant   qdrantpb.PointsClient
+	embedder *Embedder
+	apiKey   string // Qdrant API key — empty for local/unauthenticated deployments
+	logger   *slog.Logger
 }
 
-// RetrieveForDomains queries the vector store for evidence relevant to each
-// supplied domain and returns one RetrievalResult per domain.
-// STUB: returns empty slices — real Qdrant retrieval wired in a later deliverable.
-func RetrieveForDomains(_ context.Context, _ string, domains []domain.Domain, _ string) ([]RetrievalResult, error) {
-	results := make([]RetrievalResult, 0, len(domains))
-	for _, d := range domains {
-		results = append(results, RetrievalResult{
-			Domain: d,
-			Chunks: []Chunk{},
-		})
+// NewRetriever constructs a Retriever. qdrantClient must already be connected.
+// apiKey is the Qdrant Cloud API key; pass "" for local Qdrant (no auth).
+func NewRetriever(qdrantClient qdrantpb.PointsClient, embedder *Embedder, apiKey string, logger *slog.Logger) *Retriever {
+	return &Retriever{
+		qdrant:   qdrantClient,
+		embedder: embedder,
+		apiKey:   apiKey,
+		logger:   logger,
 	}
+}
+
+// qdrantCtx appends the Qdrant API key as gRPC metadata when present.
+// For local / free-tier Qdrant with no auth, the context passes through unchanged.
+func (r *Retriever) qdrantCtx(ctx context.Context) context.Context {
+	if r.apiKey == "" {
+		return ctx
+	}
+	return metadata.AppendToOutgoingContext(ctx, "api-key", r.apiKey)
+}
+
+// RetrieveForDomains runs one Qdrant search per domain concurrently and returns
+// a []RetrievalResult ordered by canonical domain sequence. It is the only
+// public method the /analyze handler calls.
+//
+// Error policy: if one domain fails (embedding or Qdrant error), it is skipped
+// and the rest continue. A partial roadmap is better than no roadmap.
+func (r *Retriever) RetrieveForDomains(ctx context.Context, req RetrieveRequest) ([]RetrievalResult, error) {
+	// Step 1 — Apply defaults.
+	if req.TopK == 0 {
+		req.TopK = 5
+	}
+	if req.Jurisdiction == "" {
+		req.Jurisdiction = "india"
+	}
+
+	// Step 2 — Retrieve concurrently, one goroutine per domain.
+	var (
+		mu      sync.Mutex
+		results []RetrievalResult
+	)
+
+	var wg sync.WaitGroup
+	for _, domain := range req.Domains {
+		domain := domain // capture loop variable
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := r.retrieveDomain(ctx, req, domain)
+			if err != nil {
+				r.logger.Error("domain retrieval failed — skipping",
+					"domain", domain,
+					"error", err,
+				)
+				return // partial failure: skip this domain, keep going
+			}
+			mu.Lock()
+			results = append(results, res)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	// Step 3 — Sort into canonical domain order.
+	sort.Slice(results, func(i, j int) bool {
+		oi := domainSortOrder(results[i].Domain)
+		oj := domainSortOrder(results[j].Domain)
+		return oi < oj
+	})
+
+	// Step 4 — Return results (may be empty if all domains failed; caller handles).
 	return results, nil
+}
+
+// retrieveDomain executes the full retrieval pipeline for a single domain:
+// build query → embed → Qdrant search → map chunks → rerank.
+func (r *Retriever) retrieveDomain(ctx context.Context, req RetrieveRequest, domain string) (RetrievalResult, error) {
+	// Step 1 — Build a semantically richer domain-specific query.
+	domainQuery := buildDomainQuery(req.BaseQuery, domain)
+
+	// Step 2 — Embed the query with a 10-second hard timeout.
+	embedCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	embedding, err := r.embedder.Embed(embedCtx, domainQuery)
+	if err != nil {
+		return RetrievalResult{}, fmt.Errorf("retrieveDomain %s: embed: %w", domain, err)
+	}
+
+	// Step 3 — Build Qdrant filter: domain AND jurisdiction must match.
+	filter := &qdrantpb.Filter{
+		Must: []*qdrantpb.Condition{
+			{
+				ConditionOneOf: &qdrantpb.Condition_Field{
+					Field: &qdrantpb.FieldCondition{
+						Key: "domain",
+						Match: &qdrantpb.Match{
+							MatchValue: &qdrantpb.Match_Keyword{
+								Keyword: domain,
+							},
+						},
+					},
+				},
+			},
+			{
+				ConditionOneOf: &qdrantpb.Condition_Field{
+					Field: &qdrantpb.FieldCondition{
+						Key: "jurisdiction",
+						Match: &qdrantpb.Match{
+							MatchValue: &qdrantpb.Match_Keyword{
+								Keyword: req.Jurisdiction,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Step 4 — Search Qdrant. Retrieve topK*2 so the reranker has room to work.
+	scoreThreshold := float32(0.35)
+	searchResult, err := r.qdrant.Search(r.qdrantCtx(ctx), &qdrantpb.SearchPoints{
+		CollectionName: qdrantCollection,
+		Vector:         toFloat32Slice(embedding),
+		Filter:         filter,
+		Limit:          uint64(req.TopK * 2),
+		WithPayload: &qdrantpb.WithPayloadSelector{
+			SelectorOptions: &qdrantpb.WithPayloadSelector_Enable{Enable: true},
+		},
+		ScoreThreshold: &scoreThreshold,
+	})
+	if err != nil {
+		return RetrievalResult{}, fmt.Errorf("retrieveDomain %s: qdrant search: %w", domain, err)
+	}
+
+	// Step 5 — Map ScoredPoints → []Chunk.
+	chunks := make([]Chunk, 0, len(searchResult.Result))
+	for _, sp := range searchResult.Result {
+		chunk := r.mapScoredPoint(sp, domain)
+		chunks = append(chunks, chunk)
+	}
+
+	// Step 6 — Rerank by authority and trim to topK.
+	reranked := rerank(chunks, req.TopK)
+
+	// Step 7 — Return result.
+	return RetrievalResult{
+		Domain:    domain,
+		Chunks:    reranked,
+		QueryUsed: domainQuery,
+	}, nil
+}
+
+// mapScoredPoint converts a Qdrant ScoredPoint to a Chunk.
+// Missing payload fields are zero/empty — never panics.
+func (r *Retriever) mapScoredPoint(sp *qdrantpb.ScoredPoint, fallbackDomain string) Chunk {
+	payload := sp.GetPayload()
+
+	text := getPayloadString(payload, "text")
+	docTitle := getPayloadString(payload, "doc_title")
+
+	if text == "" {
+		r.logger.Warn("qdrant point missing 'text' field",
+			"point_id", pointID(sp),
+			"domain", fallbackDomain,
+		)
+	}
+	if docTitle == "" {
+		r.logger.Warn("qdrant point missing 'doc_title' field",
+			"point_id", pointID(sp),
+			"domain", fallbackDomain,
+		)
+	}
+
+	authorityStr := getPayloadString(payload, "authority")
+	authority := authorityFromString(authorityStr)
+
+	domainStr := getPayloadString(payload, "domain")
+	if domainStr == "" {
+		domainStr = fallbackDomain
+	}
+
+	return Chunk{
+		ID:           pointID(sp),
+		Text:         text,
+		DocTitle:     docTitle,
+		Section:      getPayloadString(payload, "section"),
+		Domain:       domainStr,
+		Jurisdiction: getPayloadString(payload, "jurisdiction"),
+		Authority:    authority,
+		AuthorityStr: authorityStr,
+		SourceURL:    getPayloadString(payload, "source_url"),
+		RetrievedAt:  getPayloadString(payload, "retrieved_at"),
+		VectorScore:  float64(sp.GetScore()),
+	}
+}
+
+// ── Helper functions ──────────────────────────────────────────────────────────
+
+// buildDomainQuery augments the base product description with domain-specific
+// legal terminology. This dramatically improves vector retrieval quality
+// compared to submitting the raw description alone.
+func buildDomainQuery(baseQuery string, domain string) string {
+	switch domain {
+	case "patent":
+		return baseQuery + " patent eligibility novelty inventive step prior art " +
+			"traditional knowledge exclusion Section 3 Patents Act"
+	case "traditional_knowledge":
+		return baseQuery + " traditional knowledge TKDL prior art classical text " +
+			"Ayurveda Charaka Samhita patent opposition biodiversity"
+	case "biodiversity_abs":
+		return baseQuery + " biological diversity access benefit sharing NBA approval " +
+			"biological resources India commercialization ABS"
+	case "regulatory":
+		return baseQuery + " AYUSH drug licensing Drugs Cosmetics Act regulatory " +
+			"approval Ayurvedic medicine classification new drug"
+	case "trademark":
+		return baseQuery + " trademark registration brand name AYUSH product " +
+			"distinctiveness Trade Marks Act"
+	default:
+		return baseQuery
+	}
+}
+
+// toFloat32Slice is an explicit identity pass-through for readability at the Qdrant call site.
+func toFloat32Slice(f []float32) []float32 {
+	return f
+}
+
+// floatPtr returns a pointer to a float32 literal for use in proto fields.
+func floatPtr(f float32) *float32 { //nolint:unused // retained for clarity, may be used in tests
+	return &f
+}
+
+// getPayloadString safely extracts a string value from a Qdrant payload map.
+// Returns "" if the key is absent, nil, or not a string kind — never panics.
+func getPayloadString(payload map[string]*qdrantpb.Value, key string) string {
+	if payload == nil {
+		return ""
+	}
+	v, ok := payload[key]
+	if !ok || v == nil {
+		return ""
+	}
+	sv, ok := v.Kind.(*qdrantpb.Value_StringValue)
+	if !ok {
+		return ""
+	}
+	return sv.StringValue
+}
+
+// pointID extracts a stable string ID from a ScoredPoint.
+// Qdrant IDs are either UUIDs or uint64 numerics.
+func pointID(sp *qdrantpb.ScoredPoint) string {
+	if sp.GetId() == nil {
+		return ""
+	}
+	if uid := sp.GetId().GetUuid(); uid != "" {
+		return uid
+	}
+	return strconv.FormatUint(sp.GetId().GetNum(), 10)
+}
+
+// domainSortOrder returns a canonical sort priority for a domain string.
+// Unknown domains sort last (99) so they don't displace known ones.
+func domainSortOrder(domain string) int {
+	if v, ok := domainOrder[domain]; ok {
+		return v
+	}
+	return 99
 }
