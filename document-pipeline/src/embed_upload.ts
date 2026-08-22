@@ -1,32 +1,27 @@
 import "dotenv/config";
 import fs from "fs";
 import path from "path";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { Chunk } from "./types";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const GEMINI_API_KEY   = process.env.GEMINI_API_KEY   ?? "";
+const OLLAMA_URL       = process.env.OLLAMA_URL        ?? "http://localhost:11434";
 const QDRANT_URL       = process.env.QDRANT_URL        ?? "http://localhost:6333";
 const COLLECTION_NAME  = process.env.COLLECTION_NAME   ?? "ipsakti_docs";
 
-const EMBEDDING_MODEL  = "gemini-embedding-2"; // Gemini embedding model
-const VECTOR_SIZE      = 3072;                 // gemini-embedding-2 output dim
-const BATCH_SIZE       = 50;                   // batch size for upsert and embed
-const BATCH_DELAY_MS   = 5000;                 // delay between batches
-const RETRY_DELAY_MS   = 30_000;               // retry delay on error
+const EMBEDDING_MODEL  = "nomic-ipsakti"; // custom model: nomic-embed-text:v1.5 + num_ctx 4096
+const VECTOR_SIZE      = 768;                    // nomic-embed-text output dim
+const BATCH_SIZE       = 10;                     // batch size for upsert and embed
+const BATCH_DELAY_MS   = 100;                    // local server delay
+// nomic-embed-text:v1.5 default num_ctx=2048 tokens. After sanitizing mojibake, real legal text
+// at ~8000 chars is ~1800-2200 tokens — within the limit. Keep a safe buffer below 2048.
+const MAX_CHARS        = 7_500;
 
 const CHUNKS_DIR = path.resolve(__dirname, "../chunks");
 
-if (!GEMINI_API_KEY) {
-  console.error("[ERROR] GEMINI_API_KEY is not set in .env");
-  process.exit(1);
-}
-
 // ─── Clients ──────────────────────────────────────────────────────────────────
 
-const genAI  = new GoogleGenerativeAI(GEMINI_API_KEY);
 const qdrant = new QdrantClient({ url: QDRANT_URL });
 
 // ─── Stable Hash (djb2) ───────────────────────────────────────────────────────
@@ -48,8 +43,16 @@ async function ensureCollection(): Promise<void> {
   const exists   = existing.collections.some((c) => c.name === COLLECTION_NAME);
 
   if (exists) {
-    console.log(`Collection "${COLLECTION_NAME}" already exists — skipping creation.`);
-    return;
+    // Check vector size
+    const info = await qdrant.getCollection(COLLECTION_NAME);
+    const currentSize = (info.config.params.vectors as any)?.size;
+    if (currentSize === VECTOR_SIZE) {
+      console.log(`Collection "${COLLECTION_NAME}" already exists with correct dimensions (${VECTOR_SIZE}) — skipping creation.`);
+      return;
+    }
+
+    console.log(`Collection "${COLLECTION_NAME}" has incorrect dimension (${currentSize}). Deleting and recreating for dimension ${VECTOR_SIZE}...`);
+    await qdrant.deleteCollection(COLLECTION_NAME);
   }
 
   await qdrant.createCollection(COLLECTION_NAME, {
@@ -61,53 +64,87 @@ async function ensureCollection(): Promise<void> {
   console.log(`✓ Created collection "${COLLECTION_NAME}" (size=${VECTOR_SIZE}, Cosine)`);
 }
 
-// gemini-embedding-2 accepts up to 2048 tokens ≈ ~8000 chars; truncate to be safe
-const MAX_EMBED_CHARS = 7500;
+// ─── Embedding ────────────────────────────────────────────────────────────────
+
+/**
+ * Strip non-printable control characters and mojibake artifacts from PDF text.
+ * Replaces control chars (except tab, newline, carriage return) and U+FFFD with a space.
+ * Also collapses excessive whitespace.
+ */
+function sanitizeText(text: string): string {
+  return text
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\uFFFD]/g, " ")
+    .replace(/\s{3,}/g, "  ")
+    .trim();
+}
+
+/**
+ * Returns true if more than 30% of the text consists of non-ASCII / control characters —
+ * a sign of corrupted PDF extraction (e.g., garbled Devanagari). Such chunks produce
+ * meaningless embeddings and are better skipped than embedded.
+ */
+function isGarbled(text: string): boolean {
+  if (text.length === 0) return true;
+  // Indian legal acts never contain CJK text; any CJK characters are font-mapping mojibake.
+  if (/[\u4e00-\u9fff]/.test(text)) return true;
+  // Count control characters/replacements
+  const garbageCount = (text.match(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\uFFFD\uFFFE\uFFFF]/g) ?? []).length;
+  return garbageCount / text.length > 0.05; // >5% garbage = skip
+}
 
 async function embedBatch(texts: string[]): Promise<number[][]> {
-  const model = genAI.getGenerativeModel({ model: EMBEDDING_MODEL });
+  const url = `${OLLAMA_URL}/api/embed`;
 
-  const attempt = async (): Promise<number[][]> => {
-    const reqs = texts.map((t) => ({
-      model: `models/${EMBEDDING_MODEL}`,
-      content: {
-        parts: [{ text: t.length > MAX_EMBED_CHARS ? t.slice(0, MAX_EMBED_CHARS) : t }],
-      },
-    }));
+  // Sanitize (strip mojibake/control chars) then truncate to stay within token limit.
+  const formattedTexts = texts.map((t) => {
+    const clean = sanitizeText(t);
+    const safe  = clean.length > MAX_CHARS ? clean.slice(0, MAX_CHARS) : clean;
+    return `search_document: ${safe}`;
+  });
 
-    const res = await model.batchEmbedContents({ requests: reqs });
-    return res.embeddings.map((e) => e.values);
-  };
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: EMBEDDING_MODEL,
+      input: formattedTexts,
+    }),
+  });
 
-  let lastErr: unknown;
-  for (let attemptNum = 0; attemptNum < 3; attemptNum++) {
-    try {
-      return await attempt();
-    } catch (err) {
-      lastErr = err;
-      const msg = err instanceof Error ? err.message : String(err);
-      const isDailyQuota = msg.toLowerCase().includes("quota") || msg.toLowerCase().includes("exceeded your current quota");
-      if (isDailyQuota) {
-        console.error(`\n[FATAL] Gemini API Daily Quota Exceeded. Please wait for reset (PST midnight / 1:30 PM IST) or use a different API key.`);
-        process.exit(1);
-      }
-      const wait = msg.includes("429") ? RETRY_DELAY_MS : 5_000;
-      console.warn(`  ⚠  Batch embed error (attempt ${attemptNum + 1}): ${msg.slice(0, 120)}. Waiting ${wait / 1000}s…`);
-      await sleep(wait);
-    }
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Ollama API error: ${response.statusText} - ${errorText}`);
   }
 
-  throw lastErr;
+  const data = (await response.json()) as { embeddings: number[][] };
+  return data.embeddings;
 }
 
 // ─── Upload ───────────────────────────────────────────────────────────────────
 
 async function uploadChunks(chunks: Chunk[]): Promise<void> {
-  const total = chunks.length;
-  let uploaded = 0;
+  let skipped  = 0;
 
+  // Pre-filter garbled chunks (corrupted PDF extraction — mostly Hindi pages)
+  const goodChunks = chunks.filter((c) => {
+    if (isGarbled(c.text)) {
+      console.log(`  [SKIP] Garbled chunk: ${c.chunk_id.slice(0, 60)}...`);
+      skipped++;
+      return false;
+    }
+    return true;
+  });
+  
+  if (skipped > 0) {
+    console.log(`\n  Filtered out ${skipped} garbled/mojibake chunks.`);
+  }
+  
+  const total = goodChunks.length;
+  console.log(`  Actual chunks to embed & upload: ${total}\n`);
+  
+  let uploaded = 0;
   for (let i = 0; i < total; i += BATCH_SIZE) {
-    const batch  = chunks.slice(i, i + BATCH_SIZE);
+    const batch  = goodChunks.slice(i, i + BATCH_SIZE);
     const texts  = batch.map((c) => c.text);
     const vectors = await embedBatch(texts);
 
@@ -202,13 +239,13 @@ async function getExistingChunkIds(): Promise<Set<string>> {
 
 async function main(): Promise<void> {
   console.log(`\n${"─".repeat(50)}`);
-  console.log(`IP-SAKTI  ·  Embed & Upload`);
+  console.log(`IP-SAKTI  ·  Embed & Upload (Ollama)`);
   console.log(`Collection : ${COLLECTION_NAME}  |  Qdrant: ${QDRANT_URL}`);
   console.log(`Model      : ${EMBEDDING_MODEL} (dim=${VECTOR_SIZE})`);
   console.log(`${"─".repeat(50)}\n`);
 
   try {
-    // 1. Ensure Qdrant collection exists
+    // 1. Ensure Qdrant collection exists with correct dimensions
     await ensureCollection();
 
     // 2. Load all chunks from disk

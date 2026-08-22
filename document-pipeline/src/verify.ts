@@ -1,24 +1,17 @@
 import "dotenv/config";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { Domain } from "./types";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const GEMINI_API_KEY  = process.env.GEMINI_API_KEY  ?? "";
+const OLLAMA_URL      = process.env.OLLAMA_URL       ?? "http://localhost:11434";
 const QDRANT_URL      = process.env.QDRANT_URL       ?? "http://localhost:6333";
 const COLLECTION_NAME = process.env.COLLECTION_NAME  ?? "ipsakti_docs";
 
-const EMBEDDING_MODEL = "gemini-embedding-2";
-
-if (!GEMINI_API_KEY) {
-  console.error("[ERROR] GEMINI_API_KEY is not set in .env");
-  process.exit(1);
-}
+const EMBEDDING_MODEL = "nomic-ipsakti"; // custom model: nomic-embed-text:v1.5 + num_ctx 4096
 
 // ─── Clients ──────────────────────────────────────────────────────────────────
 
-const genAI  = new GoogleGenerativeAI(GEMINI_API_KEY);
 const qdrant = new QdrantClient({ url: QDRANT_URL });
 
 // ─── Required payload fields ──────────────────────────────────────────────────
@@ -31,9 +24,23 @@ const REQUIRED_FIELDS: string[] = [
 // ─── Helper: embed a single query ─────────────────────────────────────────────
 
 async function embedQuery(text: string): Promise<number[]> {
-  const model = genAI.getGenerativeModel({ model: EMBEDDING_MODEL });
-  const res   = await model.embedContent(text);
-  return res.embedding.values;
+  const url = `${OLLAMA_URL}/api/embed`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: EMBEDDING_MODEL,
+      input: [`search_query: ${text}`],
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Ollama API error: ${response.statusText} - ${errorText}`);
+  }
+
+  const data = (await response.json()) as { embeddings: number[][] };
+  return data.embeddings[0];
 }
 
 // ─── Helper: divider ─────────────────────────────────────────────────────────

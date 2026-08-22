@@ -6,7 +6,7 @@ import { Domain } from "./types";
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const GEMINI_API_KEY  = process.env.GEMINI_API_KEY ?? "";
-const GENERATION_MODEL = "gemini-1.5-flash";
+const GENERATION_MODEL = "gemini-3.6-flash";
 
 if (!GEMINI_API_KEY) {
   console.error("[ERROR] GEMINI_API_KEY is not set in .env");
