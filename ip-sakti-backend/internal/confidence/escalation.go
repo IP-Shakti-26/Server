@@ -104,16 +104,19 @@ func DetermineEscalations(
 
 // profTypeForDomain maps an IP/regulatory domain to the appropriate professional type.
 func profTypeForDomain(domainStr string) string {
+	// NOTE: the domain.Domain* constants already hold these exact string values,
+	// so listing both the literal and the constant in one case is a duplicate
+	// and does not compile. The constants are the single source of truth.
 	switch domainStr {
-	case "patent", string(domain.DomainPatent):
+	case string(domain.DomainPatent):
 		return "patent_agent"
-	case "traditional_knowledge", string(domain.DomainTK):
+	case string(domain.DomainTK):
 		return "patent_agent"
-	case "biodiversity_abs", string(domain.DomainABS):
+	case string(domain.DomainABS):
 		return "nba_expert"
-	case "regulatory", string(domain.DomainRegulatory):
+	case string(domain.DomainRegulatory):
 		return "regulatory_expert"
-	case "trademark", string(domain.DomainTrademark):
+	case string(domain.DomainTrademark):
 		return "trademark_agent"
 	default:
 		return "ip_attorney"
