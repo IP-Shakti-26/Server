@@ -10,7 +10,7 @@ test:
 	go test ./...
 
 migrate:
-	psql $(DATABASE_URL) -f migrations/001_initial.sql
+	go run ./scripts/migrate/main.go
 
 tidy:
 	go mod tidy
