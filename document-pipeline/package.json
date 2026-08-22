@@ -4,17 +4,21 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "extract": "ts-node src/extract.ts",
+    "chunk": "ts-node src/chunk.ts",
+    "upload": "ts-node src/embed_upload.ts",
+    "verify": "ts-node src/verify.ts",
+    "test-retrieval": "ts-node src/retrieval_test.ts"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@google/generative-ai": "^0.24.1",
     "@qdrant/js-client-rest": "^1.19.0",
     "@types/node": "^26.2.0",
     "@types/pdf-parse": "^1.1.5",
     "dotenv": "^17.4.2",
-    "openai": "^7.5.0",
     "pdf-parse": "^2.4.5",
     "ts-node": "^10.9.2",
     "typescript": "^7.0.2"
