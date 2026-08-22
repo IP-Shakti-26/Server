@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/heythisissud/ip-sakti-backend/internal/classifier"
+	"github.com/heythisissud/ip-sakti-backend/internal/confidence"
 	"github.com/heythisissud/ip-sakti-backend/internal/retriever"
 	"github.com/heythisissud/ip-sakti-backend/internal/store"
 	"github.com/heythisissud/ip-sakti-backend/internal/synthesizer"
@@ -281,7 +282,11 @@ func (h *Handler) AnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 7 — Persist roadmap. This is best-effort: if the DB write fails,
+	// Step 7 — Finalize (confidence scoring, escalation, consistency overrides).
+	// This is the D5 addition. Mutates roadmap in-place.
+	confidence.Finalize(roadmap, sess.Classification, evidence, h.logger)
+
+	// Step 8 — Persist roadmap. This is best-effort: if the DB write fails,
 	// the roadmap is still returned to the client. Log at ERROR but do not 500.
 	if err := h.store.UpdateRoadmap(ctx, sess.ID, roadmap); err != nil {
 		h.logger.Error("failed to persist roadmap",

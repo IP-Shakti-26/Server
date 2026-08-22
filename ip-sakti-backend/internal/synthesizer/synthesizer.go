@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/heythisissud/ip-sakti-backend/internal/classifier"
 	"github.com/heythisissud/ip-sakti-backend/internal/retriever"
 	"github.com/heythisissud/ip-sakti-backend/pkg/domain"
 	"google.golang.org/genai"
@@ -83,7 +82,7 @@ func NewSynthesizer(client *genai.Client, logger *slog.Logger) *Synthesizer {
 //  8. Set disclaimer and return
 func (s *Synthesizer) Synthesize(
 	ctx context.Context,
-	classification *classifier.ClassificationResult,
+	classification *domain.ClassificationResult,
 	evidence []retriever.RetrievalResult,
 ) (*domain.IPRoadmap, error) {
 	// ── Step 1: Build evidence index ─────────────────────────────────────────

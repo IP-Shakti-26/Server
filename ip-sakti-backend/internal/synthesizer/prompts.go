@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/heythisissud/ip-sakti-backend/internal/classifier"
 	"github.com/heythisissud/ip-sakti-backend/internal/retriever"
+	"github.com/heythisissud/ip-sakti-backend/pkg/domain"
 )
 
 // synthesisSystemPrompt is the instruction given to Gemini on every synthesis call.
@@ -264,7 +264,7 @@ func buildEvidenceContext(evidence []retriever.RetrievalResult) string {
 // buildSynthesisPrompt constructs the user message sent to the LLM alongside
 // the system prompt. It embeds the classification and evidence context.
 func buildSynthesisPrompt(
-	classification *classifier.ClassificationResult,
+	classification *domain.ClassificationResult,
 	evidenceContext string,
 ) string {
 	var sb strings.Builder
