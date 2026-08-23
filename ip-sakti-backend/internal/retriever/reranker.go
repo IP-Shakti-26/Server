@@ -1,6 +1,9 @@
 package retriever
 
-import "sort"
+import (
+	"sort"
+	"strings"
+)
 
 const (
 	vectorWeight    = 0.55
@@ -28,7 +31,8 @@ func rerank(chunks []Chunk, topK int) []Chunk {
 	// Compute FinalScore for each chunk.
 	for i := range chunks {
 		chunks[i].FinalScore = (chunks[i].VectorScore * vectorWeight) +
-			(authorityScore(chunks[i].Authority) * authorityWeight)
+			(authorityScore(chunks[i].Authority) * authorityWeight) +
+			keywordBonus(chunks[i].Text)
 	}
 
 	// Sort descending by FinalScore.
@@ -41,4 +45,19 @@ func rerank(chunks []Chunk, topK int) []Chunk {
 		return chunks
 	}
 	return chunks[:topK]
+}
+
+func keywordBonus(text string) float64 {
+	lower := strings.ToLower(text)
+	bonus := 0.0
+	if strings.Contains(lower, "section 3") || strings.Contains(lower, "3(p)") || strings.Contains(lower, "3(d)") || strings.Contains(lower, "3(e)") {
+		bonus += 0.25
+	}
+	if strings.Contains(lower, "traditional knowledge") || strings.Contains(lower, "tkdl") {
+		bonus += 0.15
+	}
+	if strings.Contains(lower, "benefit sharing") || strings.Contains(lower, "biological diversity") {
+		bonus += 0.15
+	}
+	return bonus
 }

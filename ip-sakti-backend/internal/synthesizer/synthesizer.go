@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	synthesisModel   = "gemini-2.0-flash"
-	synthesisTimeout = 45 * time.Second
+	synthesisModel   = "gemini-3.5-flash"
+	synthesisTimeout = 90 * time.Second
 	maxRawLogLen     = 500
 )
 
@@ -113,24 +113,41 @@ func (s *Synthesizer) Synthesize(
 	// ── Step 3: Build user message ───────────────────────────────────────────
 	userMsg := buildSynthesisPrompt(classification, evidenceContext)
 
-	// ── Step 4: Call Gemini ───────────────────────────────────────────────────
-	callCtx, cancel := context.WithTimeout(ctx, synthesisTimeout)
-	defer cancel()
+	// ── Step 4: Call Gemini with exponential backoff for 429 rate limits ─────
+	var resp *genai.GenerateContentResponse
+	var err error
+	maxRetries := 3
 
-	resp, err := s.client.Models.GenerateContent(
-		callCtx,
-		synthesisModel,
-		genai.Text(userMsg),
-		&genai.GenerateContentConfig{
-			SystemInstruction: &genai.Content{
-				Parts: []*genai.Part{genai.NewPartFromText(synthesisSystemPrompt)},
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, synthesisTimeout)
+		resp, err = s.client.Models.GenerateContent(
+			callCtx,
+			synthesisModel,
+			genai.Text(userMsg),
+			&genai.GenerateContentConfig{
+				SystemInstruction: &genai.Content{
+					Parts: []*genai.Part{genai.NewPartFromText(synthesisSystemPrompt)},
+				},
+				Temperature:      genai.Ptr(float32(0)),
+				MaxOutputTokens:  8192,
+				ResponseMIMEType: "application/json",
 			},
-			Temperature:      genai.Ptr(float32(0)),
-			MaxOutputTokens:  3000,
-			ResponseMIMEType: "application/json",
-		},
-	)
-	if err != nil {
+		)
+		cancel()
+
+		if err == nil {
+			break
+		}
+
+		if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "RESOURCE_EXHAUSTED") {
+			if attempt < maxRetries {
+				backoff := time.Duration(1<<attempt*5) * time.Second
+				s.logger.Warn("Gemini synthesis rate limit hit; retrying", "attempt", attempt+1, "backoff", backoff)
+				time.Sleep(backoff)
+				continue
+			}
+		}
+
 		s.logger.Error("gemini synthesis failed", "error", err)
 		return nil, fmt.Errorf("synthesizer: Gemini API call failed: %w", err)
 	}

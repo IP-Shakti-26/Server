@@ -33,38 +33,57 @@ var domainOrder = map[string]int{
 // Retriever is the evidence engine. It embeds a query, filters by domain and
 // jurisdiction in Qdrant, and reranks by legal authority.
 type Retriever struct {
-	qdrant   qdrantpb.PointsClient
-	embedder *Embedder
-	apiKey   string // Qdrant API key — empty for local/unauthenticated deployments
-	logger   *slog.Logger
+	qdrant         qdrantpb.PointsClient
+	embedder       *Embedder
+	apiKey         string // Qdrant API key — empty for local/unauthenticated deployments
+	collectionName string // Qdrant collection name
+	logger         *slog.Logger
 }
 
 // NewRetriever constructs a Retriever. qdrantClient must already be connected.
 // apiKey is the Qdrant Cloud API key; pass "" for local Qdrant (no auth).
-func NewRetriever(qdrantClient qdrantpb.PointsClient, embedder *Embedder, apiKey string, logger *slog.Logger) *Retriever {
+func NewRetriever(qdrantClient qdrantpb.PointsClient, embedder *Embedder, apiKey string, logger *slog.Logger, collectionName ...string) *Retriever {
+	coll := qdrantCollection
+	if len(collectionName) > 0 && collectionName[0] != "" {
+		coll = collectionName[0]
+	}
 	return &Retriever{
-		qdrant:   qdrantClient,
-		embedder: embedder,
-		apiKey:   apiKey,
-		logger:   logger,
+		qdrant:         qdrantClient,
+		embedder:       embedder,
+		apiKey:         apiKey,
+		collectionName: coll,
+		logger:         logger,
 	}
 }
 
-// qdrantCtx appends the Qdrant API key as gRPC metadata when present.
-// For local / free-tier Qdrant with no auth, the context passes through unchanged.
+// qdrantCtx appends the Qdrant API key and ngrok-skip-browser-warning header as gRPC metadata.
+// For ngrok free tier, this bypasses the browser warning page on non-browser requests.
 func (r *Retriever) qdrantCtx(ctx context.Context) context.Context {
-	if r.apiKey == "" {
-		return ctx
+	ctx = metadata.AppendToOutgoingContext(ctx, "ngrok-skip-browser-warning", "true")
+	if r.apiKey != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, "api-key", r.apiKey)
 	}
-	return metadata.AppendToOutgoingContext(ctx, "api-key", r.apiKey)
+	return ctx
+}
+
+// qdrantDomain maps internal domain constants to the values stored in Qdrant
+func qdrantDomain(domain string) string {
+	switch domain {
+	case "biodiversity_abs":
+		return "biodiversity"
+	case "traditional_knowledge":
+		return "patent"
+	default:
+		return domain
+	}
 }
 
 // RetrieveForDomains runs one Qdrant search per domain concurrently and returns
 // a []RetrievalResult ordered by canonical domain sequence. It is the only
 // public method the /analyze handler calls.
 //
-// Error policy: if one domain fails (embedding or Qdrant error), it is skipped
-// and the rest continue. A partial roadmap is better than no roadmap.
+// Error policy: if one domain fails (embedding or Qdrant error), an empty result
+// for that domain is recorded and the rest continue. A partial roadmap is better than no roadmap.
 func (r *Retriever) RetrieveForDomains(ctx context.Context, req RetrieveRequest) ([]RetrievalResult, error) {
 	// Step 1 — Apply defaults.
 	if req.TopK == 0 {
@@ -88,11 +107,18 @@ func (r *Retriever) RetrieveForDomains(ctx context.Context, req RetrieveRequest)
 			defer wg.Done()
 			res, err := r.retrieveDomain(ctx, req, domain)
 			if err != nil {
-				r.logger.Error("domain retrieval failed — skipping",
+				r.logger.Error("domain retrieval failed",
 					"domain", domain,
 					"error", err,
 				)
-				return // partial failure: skip this domain, keep going
+				mu.Lock()
+				results = append(results, RetrievalResult{
+					Domain:    domain,
+					Chunks:    nil,
+					QueryUsed: "",
+				})
+				mu.Unlock()
+				return
 			}
 			mu.Lock()
 			results = append(results, res)
@@ -136,7 +162,7 @@ func (r *Retriever) retrieveDomain(ctx context.Context, req RetrieveRequest, dom
 						Key: "domain",
 						Match: &qdrantpb.Match{
 							MatchValue: &qdrantpb.Match_Keyword{
-								Keyword: domain,
+								Keyword: qdrantDomain(domain),
 							},
 						},
 					},
@@ -158,12 +184,12 @@ func (r *Retriever) retrieveDomain(ctx context.Context, req RetrieveRequest, dom
 	}
 
 	// Step 4 — Search Qdrant. Retrieve topK*2 so the reranker has room to work.
-	scoreThreshold := float32(0.35)
+	scoreThreshold := float32(0.01)
 	searchResult, err := r.qdrant.Search(r.qdrantCtx(ctx), &qdrantpb.SearchPoints{
-		CollectionName: qdrantCollection,
+		CollectionName: r.collectionName,
 		Vector:         toFloat32Slice(embedding),
 		Filter:         filter,
-		Limit:          uint64(req.TopK * 2),
+		Limit:          uint64(50),
 		WithPayload: &qdrantpb.WithPayloadSelector{
 			SelectorOptions: &qdrantpb.WithPayloadSelector_Enable{Enable: true},
 		},
@@ -171,6 +197,26 @@ func (r *Retriever) retrieveDomain(ctx context.Context, req RetrieveRequest, dom
 	})
 	if err != nil {
 		return RetrievalResult{}, fmt.Errorf("retrieveDomain %s: qdrant search: %w", domain, err)
+	}
+
+	// Fallback Step — If filtered search returns 0 results, retry WITHOUT filters to verify vector retrieval.
+	if len(searchResult.Result) == 0 {
+		r.logger.Warn("filtered search returned 0 results; retrying search without domain/jurisdiction filters",
+			"domain", domain,
+		)
+		searchResult, err = r.qdrant.Search(r.qdrantCtx(ctx), &qdrantpb.SearchPoints{
+			CollectionName: r.collectionName,
+			Vector:         toFloat32Slice(embedding),
+			Filter:         nil, // no payload filters
+			Limit:          uint64(50),
+			WithPayload: &qdrantpb.WithPayloadSelector{
+				SelectorOptions: &qdrantpb.WithPayloadSelector_Enable{Enable: true},
+			},
+			ScoreThreshold: &scoreThreshold,
+		})
+		if err != nil {
+			return RetrievalResult{}, fmt.Errorf("retrieveDomain %s (fallback): qdrant search: %w", domain, err)
+		}
 	}
 
 	// Step 5 — Map ScoredPoints → []Chunk.
@@ -224,7 +270,7 @@ func (r *Retriever) mapScoredPoint(sp *qdrantpb.ScoredPoint, fallbackDomain stri
 		ID:           pointID(sp),
 		Text:         text,
 		DocTitle:     docTitle,
-		Section:      getPayloadString(payload, "section"),
+		Section:      getPayloadString(payload, "section_ref"),
 		Domain:       domainStr,
 		Jurisdiction: getPayloadString(payload, "jurisdiction"),
 		Authority:    authority,
@@ -244,10 +290,10 @@ func buildDomainQuery(baseQuery string, domain string) string {
 	switch domain {
 	case "patent":
 		return baseQuery + " patent eligibility novelty inventive step prior art " +
-			"traditional knowledge exclusion Section 3 Patents Act"
+			"traditional knowledge exclusion Section 3 Section 3(p) Section 3(d) Patents Act"
 	case "traditional_knowledge":
 		return baseQuery + " traditional knowledge TKDL prior art classical text " +
-			"Ayurveda Charaka Samhita patent opposition biodiversity"
+			"Ayurveda Charaka Samhita Section 3(p) Patents Act opposition"
 	case "biodiversity_abs":
 		return baseQuery + " biological diversity access benefit sharing NBA approval " +
 			"biological resources India commercialization ABS"

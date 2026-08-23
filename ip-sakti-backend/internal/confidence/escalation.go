@@ -103,17 +103,17 @@ func DetermineEscalations(
 }
 
 // profTypeForDomain maps an IP/regulatory domain to the appropriate professional type.
-func profTypeForDomain(domainStr string) string {
-	switch domainStr {
-	case "patent", string(domain.DomainPatent):
+func profTypeForDomain(d string) string {
+	switch d {
+	case "patent":
 		return "patent_agent"
-	case "traditional_knowledge", string(domain.DomainTK):
+	case "traditional_knowledge":
 		return "patent_agent"
-	case "biodiversity_abs", string(domain.DomainABS):
+	case "biodiversity_abs":
 		return "nba_expert"
-	case "regulatory", string(domain.DomainRegulatory):
+	case "regulatory":
 		return "regulatory_expert"
-	case "trademark", string(domain.DomainTrademark):
+	case "trademark":
 		return "trademark_agent"
 	default:
 		return "ip_attorney"

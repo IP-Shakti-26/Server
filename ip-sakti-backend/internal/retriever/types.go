@@ -17,11 +17,11 @@ const (
 // This must match exactly what Teammate 2 stores during ingestion.
 func authorityFromString(s string) AuthorityLevel {
 	switch strings.ToLower(s) {
-	case "statute":
+	case "statute", "parliament", "act":
 		return AuthorityStatute
-	case "rules":
+	case "rules", "regulation", "regulations":
 		return AuthorityRules
-	case "guidance":
+	case "guidance", "policy", "factsheet":
 		return AuthorityGuidance
 	default:
 		return AuthoritySecondary

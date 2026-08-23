@@ -74,7 +74,7 @@ func main() {
 	logger.Info("Qdrant client initialised", "addr", qdrantAddr)
 
 	// ── Embedder (text-embedding-004 via Google AI) ───────────────────────
-	embedder, err := retriever.NewEmbedder(cfg.GeminiAPIKey, logger)
+	embedder, err := retriever.NewEmbedder(geminiClient, logger)
 	if err != nil {
 		logger.Error("failed to create embedder", "error", err)
 		os.Exit(1)
@@ -83,7 +83,7 @@ func main() {
 
 	// ── Retriever ─────────────────────────────────────────────────────────
 	// cfg.QdrantAPIKey is "" for local Qdrant; non-empty for Qdrant Cloud.
-	ret := retriever.NewRetriever(qdrantClient, embedder, cfg.QdrantAPIKey, logger)
+	ret := retriever.NewRetriever(qdrantClient, embedder, cfg.QdrantAPIKey, logger, cfg.QdrantCollection)
 
 	// ── Dependency injection ──────────────────────────────────────────────
 	st := store.NewStore(pool)
@@ -97,7 +97,7 @@ func main() {
 		Addr:         fmt.Sprintf(":%s", cfg.Port),
 		Handler:      router,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
+		WriteTimeout: 120 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 

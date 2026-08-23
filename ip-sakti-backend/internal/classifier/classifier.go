@@ -13,8 +13,8 @@ import (
 )
 
 const (
-	geminiModel     = "gemini-2.0-flash"
-	classifyTimeout = 30 * time.Second
+	geminiModel     = "gemini-3.5-flash"
+	classifyTimeout = 60 * time.Second
 )
 
 // classificationRaw is the intermediate struct used for JSON parsing before
@@ -55,26 +55,43 @@ func (c *Classifier) Classify(ctx context.Context, description string, clarifica
 	// Step 2 — Build user message.
 	userMsg := buildClassificationPrompt(description, clarifications)
 
-	// Step 3 — Call Gemini with a hard timeout.
-	callCtx, cancel := context.WithTimeout(ctx, classifyTimeout)
-	defer cancel()
+	// Step 3 — Call Gemini with exponential backoff for 429 rate limits.
+	var resp *genai.GenerateContentResponse
+	var err error
+	maxRetries := 3
 
-	resp, err := c.client.Models.GenerateContent(
-		callCtx,
-		geminiModel,
-		genai.Text(userMsg),
-		&genai.GenerateContentConfig{
-			SystemInstruction: &genai.Content{
-				Parts: []*genai.Part{genai.NewPartFromText(classificationSystemPrompt)},
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, classifyTimeout)
+		resp, err = c.client.Models.GenerateContent(
+			callCtx,
+			geminiModel,
+			genai.Text(userMsg),
+			&genai.GenerateContentConfig{
+				SystemInstruction: &genai.Content{
+					Parts: []*genai.Part{genai.NewPartFromText(classificationSystemPrompt)},
+				},
+				Temperature:      genai.Ptr(float32(0)),
+				MaxOutputTokens:  4096,
+				ResponseMIMEType: "application/json",
 			},
-			Temperature:      genai.Ptr(float32(0)),
-			MaxOutputTokens:  1024,
-			ResponseMIMEType: "application/json",
-		},
-	)
-	if err != nil {
-		if callCtx.Err() != nil {
-			return nil, fmt.Errorf("classification timed out: %w", callCtx.Err())
+		)
+		cancel()
+
+		if err == nil {
+			break
+		}
+
+		if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "RESOURCE_EXHAUSTED") {
+			if attempt < maxRetries {
+				backoff := time.Duration(1<<attempt*3) * time.Second
+				c.logger.Warn("Gemini rate limit hit; retrying", "attempt", attempt+1, "backoff", backoff)
+				time.Sleep(backoff)
+				continue
+			}
+		}
+
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("classification timed out: %w", ctx.Err())
 		}
 		return nil, fmt.Errorf("classifier: Gemini API call failed: %w", err)
 	}

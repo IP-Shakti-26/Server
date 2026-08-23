@@ -32,11 +32,20 @@ func NewRouter(h *Handler, cfg *config.Config, logger *slog.Logger) *chi.Mux {
 	}))
 
 	// ── Routes ────────────────────────────────────────────────────────────
+	// Top-level aliases
+	r.Get("/health", h.HealthHandler)
+	r.Post("/classify", h.ClassifyHandler)
+	r.Post("/clarify", h.ClarifyHandler)
+	r.Post("/analyze", h.AnalyzeHandler)
+	r.Get("/debug/retrieve", h.DebugRetrieveHandler)
+
+	// Versioned API routes
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Get("/health", h.HealthHandler)
 		r.Post("/classify", h.ClassifyHandler)
 		r.Post("/clarify", h.ClarifyHandler)
 		r.Post("/analyze", h.AnalyzeHandler)
+		r.Get("/debug/retrieve", h.DebugRetrieveHandler)
 	})
 
 	return r

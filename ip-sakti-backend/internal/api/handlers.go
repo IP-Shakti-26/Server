@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/heythisissud/ip-sakti-backend/internal/classifier"
@@ -60,6 +61,26 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+
+func (h *Handler) DebugRetrieveHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	evidence, err := h.retriever.RetrieveForDomains(ctx, retriever.RetrieveRequest{
+		BaseQuery:    "Ashwagandha joint pain formulation patent India",
+		Domains:      []string{"patent", "biodiversity_abs", "traditional_knowledge"},
+		Jurisdiction: "india",
+		TopK:         3,
+	})
+	if err != nil {
+		respond.JSON(w, 500, map[string]any{"step": "retrieve_failed", "error": err.Error()})
+		return
+	}
+
+	respond.JSON(w, 200, map[string]any{
+		"status":   "success",
+		"evidence": evidence,
+	})
+}
 // ClassifyHandler handles POST /api/v1/classify.
 func (h *Handler) ClassifyHandler(w http.ResponseWriter, r *http.Request) {
 	var req ClassifyRequest
@@ -272,7 +293,7 @@ func (h *Handler) AnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 	roadmap, err := h.synthesizer.Synthesize(ctx, sess.Classification, evidence)
 	if err != nil {
 		// Check specifically for synthesis timeout — return 504, not 500.
-		if errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "504") || strings.Contains(err.Error(), "DEADLINE_EXCEEDED") {
 			h.logger.Error("synthesis timed out", "session_id", req.SessionID, "error", err)
 			respond.Error(w, http.StatusGatewayTimeout, "synthesis timed out", "hint", "retry the request")
 			return

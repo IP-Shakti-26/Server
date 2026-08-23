@@ -19,6 +19,7 @@ type Config struct {
 	QdrantPort      string   // HTTP REST port, default 6333
 	QdrantGRPCPort  string   // gRPC port, default 6334
 	QdrantAPIKey    string
+	QdrantCollection string  // QDRANT_COLLECTION, default "ipsakti_chunks"
 	OpenAIAPIKey    string   // OPENAI_API_KEY, optional (for embeddings, future)
 	Env             string
 	AllowedOrigins  []string
@@ -39,6 +40,7 @@ func Load() (*Config, error) {
 		QdrantPort:      getEnvOrDefault("QDRANT_PORT", "6333"),
 		QdrantGRPCPort:  getEnvOrDefault("QDRANT_GRPC_PORT", "6334"),
 		QdrantAPIKey:    os.Getenv("QDRANT_API_KEY"),
+		QdrantCollection: getEnvOrDefault("QDRANT_COLLECTION", "ipsakti_chunks"),
 		OpenAIAPIKey:    os.Getenv("OPENAI_API_KEY"),
 		Env:             getEnvOrDefault("APP_ENV", "development"),
 		AllowedOrigins:  parseOrigins(getEnvOrDefault("ALLOWED_ORIGINS", "*")),
