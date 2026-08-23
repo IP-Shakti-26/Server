@@ -1,24 +1,15 @@
 import "dotenv/config";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { Domain } from "./types";
+import { embedQuery, EMBEDDING_MODEL } from "./embeddings";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const GEMINI_API_KEY  = process.env.GEMINI_API_KEY  ?? "";
-const QDRANT_URL      = process.env.QDRANT_URL       ?? "http://localhost:6333";
+const QDRANT_URL      = process.env.QDRANT_URL       ?? "http://127.0.0.1:6333";
 const COLLECTION_NAME = process.env.COLLECTION_NAME  ?? "ipsakti_docs";
-
-const EMBEDDING_MODEL = "gemini-embedding-2";
-
-if (!GEMINI_API_KEY) {
-  console.error("[ERROR] GEMINI_API_KEY is not set in .env");
-  process.exit(1);
-}
 
 // ─── Clients ──────────────────────────────────────────────────────────────────
 
-const genAI  = new GoogleGenerativeAI(GEMINI_API_KEY);
 const qdrant = new QdrantClient({ url: QDRANT_URL });
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -39,10 +30,8 @@ export async function retrieve(
   domains: Domain[],
   topK:    number
 ): Promise<SearchResult[]> {
-  // 1. Embed query with Gemini
-  const model  = genAI.getGenerativeModel({ model: EMBEDDING_MODEL });
-  const res    = await model.embedContent(query);
-  const vector = res.embedding.values;
+  // 1. Embed query using unified embeddings module
+  const vector = await embedQuery(query);
 
   // 2. Build domain filter — match any of the provided domains
   const domainFilter =
