@@ -4,15 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/heythisissud/ip-sakti-backend/internal/classifier"
 	"github.com/heythisissud/ip-sakti-backend/internal/confidence"
+	"github.com/heythisissud/ip-sakti-backend/internal/report"
 	"github.com/heythisissud/ip-sakti-backend/internal/retriever"
 	"github.com/heythisissud/ip-sakti-backend/internal/store"
+	"github.com/heythisissud/ip-sakti-backend/internal/summary"
 	"github.com/heythisissud/ip-sakti-backend/internal/synthesizer"
 	"github.com/heythisissud/ip-sakti-backend/pkg/config"
 	"github.com/heythisissud/ip-sakti-backend/pkg/respond"
@@ -27,11 +31,12 @@ type Handler struct {
 	classifier  *classifier.Classifier
 	retriever   *retriever.Retriever
 	synthesizer *synthesizer.Synthesizer
+	summarizer  *summary.Summarizer
 	logger      *slog.Logger
 }
 
 // NewHandler constructs a Handler with all required dependencies.
-func NewHandler(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, cl *classifier.Classifier, ret *retriever.Retriever, syn *synthesizer.Synthesizer, logger *slog.Logger) *Handler {
+func NewHandler(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, cl *classifier.Classifier, ret *retriever.Retriever, syn *synthesizer.Synthesizer, sum *summary.Summarizer, logger *slog.Logger) *Handler {
 	return &Handler{
 		cfg:         cfg,
 		pool:        pool,
@@ -39,6 +44,7 @@ func NewHandler(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, cl *cla
 		classifier:  cl,
 		retriever:   ret,
 		synthesizer: syn,
+		summarizer:  sum,
 		logger:      logger,
 	}
 }
@@ -324,3 +330,116 @@ func (h *Handler) AnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 	})
 }
+
+// ReportHandler handles GET /api/v1/report/{session_id}.
+func (h *Handler) ReportHandler(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "session_id")
+	if sessionID == "" {
+		respond.Error(w, http.StatusBadRequest, "session_id is required")
+		return
+	}
+
+	ctx := r.Context()
+	sess, err := h.store.GetSession(ctx, sessionID)
+	if errors.Is(err, store.ErrSessionNotFound) {
+		respond.NotFound(w, "session")
+		return
+	}
+	if err != nil {
+		respond.InternalError(w, err, h.logger)
+		return
+	}
+
+	if sess.Roadmap == nil {
+		respond.Error(w, http.StatusConflict, "analysis not complete", "hint", "call /analyze first")
+		return
+	}
+
+	pdfBytes, err := report.GeneratePDF(sessionID, sess.Roadmap)
+	if err != nil {
+		respond.InternalError(w, err, h.logger)
+		return
+	}
+
+	sessShort := sessionID
+	if len(sessShort) > 8 {
+		sessShort = sessShort[:8]
+	}
+
+	w.Header().Set("Content-Type", "application/pdf")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=ipsakti-report-%s.pdf", sessShort))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(pdfBytes)
+}
+
+// SummaryHandler handles GET /api/v1/summary/{session_id}.
+func (h *Handler) SummaryHandler(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "session_id")
+	if sessionID == "" {
+		respond.Error(w, http.StatusBadRequest, "session_id is required")
+		return
+	}
+
+	ctx := r.Context()
+	sess, err := h.store.GetSession(ctx, sessionID)
+	if errors.Is(err, store.ErrSessionNotFound) {
+		respond.NotFound(w, "session")
+		return
+	}
+	if err != nil {
+		respond.InternalError(w, err, h.logger)
+		return
+	}
+
+	if sess.Roadmap == nil {
+		respond.Error(w, http.StatusConflict, "analysis not complete", "hint", "call /analyze first")
+		return
+	}
+
+	sumOut := h.summarizer.Summarize(ctx, sess.Roadmap)
+
+	respond.JSON(w, http.StatusOK, SummaryResponse{
+		SessionID:       sessionID,
+		Headline:        sumOut.Headline,
+		Summary:         sumOut.Summary,
+		TopAction:       sumOut.TopAction,
+		ConfidenceLabel: sumOut.ConfidenceLabel,
+		ConfidenceValue: sumOut.ConfidenceValue,
+	})
+}
+
+// ExamplesHandler handles GET /api/v1/examples.
+func (h *Handler) ExamplesHandler(w http.ResponseWriter, r *http.Request) {
+	examples := []Example{
+		{
+			ID:          "ex_01",
+			Title:       "Joint Pain Formulation (India + Germany)",
+			Description: "I created a new Ayurvedic joint-pain formulation using Ashwagandha and Shallaki. The ingredients are sourced from India. It is not directly copied from a classical formulation. I want to sell it in India and later Germany.",
+			Tags:        []string{"proprietary", "international", "abs", "patent"},
+			Complexity:  "high",
+		},
+		{
+			ID:          "ex_02",
+			Title:       "Classical Dashamoola Preparation",
+			Description: "I am preparing Dashamoola Kwatha exactly as described in Charaka Samhita. All ten roots, traditional preparation method, same proportions. Herbs sourced from Indian forests. Planning to sell only within India to Ayurvedic practitioners.",
+			Tags:        []string{"classical", "traditional_knowledge", "india_only"},
+			Complexity:  "medium",
+		},
+		{
+			ID:          "ex_03",
+			Title:       "Herbal Sleep Supplement",
+			Description: "I have developed a herbal sleep supplement using Ashwagandha root extract and Brahmi. It is in capsule form, not a traditional preparation. I am marketing it as a natural food supplement for stress and sleep. Sourced from certified organic farms in India. Selling online in India only.",
+			Tags:        []string{"food_nutraceutical", "regulatory", "trademark"},
+			Complexity:  "medium",
+		},
+		{
+			ID:          "ex_04",
+			Title:       "Novel Extraction Process",
+			Description: "I have developed a new cold-press extraction process for Turmeric that preserves curcumin levels 40% higher than standard methods. The formulation itself uses classical ingredients but the process is entirely new. I want to patent the process and sell the product globally including USA and EU.",
+			Tags:        []string{"process_patent", "international", "proprietary"},
+			Complexity:  "high",
+		},
+	}
+	respond.JSON(w, http.StatusOK, map[string]any{"examples": examples})
+}
+

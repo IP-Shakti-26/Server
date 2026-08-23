@@ -38,6 +38,9 @@ func NewRouter(h *Handler, cfg *config.Config, logger *slog.Logger) *chi.Mux {
 	r.Post("/clarify", h.ClarifyHandler)
 	r.Post("/analyze", h.AnalyzeHandler)
 	r.Get("/debug/retrieve", h.DebugRetrieveHandler)
+	r.Get("/examples", h.ExamplesHandler)
+	r.Get("/summary/{session_id}", h.SummaryHandler)
+	r.Get("/report/{session_id}", h.ReportHandler)
 
 	// Versioned API routes
 	r.Route("/api/v1", func(r chi.Router) {
@@ -46,7 +49,11 @@ func NewRouter(h *Handler, cfg *config.Config, logger *slog.Logger) *chi.Mux {
 		r.Post("/clarify", h.ClarifyHandler)
 		r.Post("/analyze", h.AnalyzeHandler)
 		r.Get("/debug/retrieve", h.DebugRetrieveHandler)
+		r.Get("/examples", h.ExamplesHandler)
+		r.Get("/summary/{session_id}", h.SummaryHandler)
+		r.Get("/report/{session_id}", h.ReportHandler)
 	})
 
 	return r
 }
+
