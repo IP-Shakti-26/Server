@@ -3,19 +3,21 @@ import fs from "fs";
 import path from "path";
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { Chunk } from "./types";
+import { 
+  embedBatch, 
+  EMBEDDING_MODEL, 
+  VECTOR_SIZE, 
+  EMBEDDING_PROVIDER 
+} from "./embeddings";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const OLLAMA_URL       = process.env.OLLAMA_URL        ?? "http://localhost:11434";
-const QDRANT_URL       = process.env.QDRANT_URL        ?? "http://localhost:6333";
+const QDRANT_URL       = process.env.QDRANT_URL        ?? "http://127.0.0.1:6333";
 const COLLECTION_NAME  = process.env.COLLECTION_NAME   ?? "ipsakti_docs";
 
-const EMBEDDING_MODEL  = "nomic-ipsakti"; // custom model: nomic-embed-text:v1.5 + num_ctx 4096
-const VECTOR_SIZE      = 768;                    // nomic-embed-text output dim
-const BATCH_SIZE       = 10;                     // batch size for upsert and embed
-const BATCH_DELAY_MS   = 100;                    // local server delay
-// nomic-embed-text:v1.5 default num_ctx=2048 tokens. After sanitizing mojibake, real legal text
-// at ~8000 chars is ~1800-2200 tokens — within the limit. Keep a safe buffer below 2048.
+// Set optimized batch size and delay for Gemini to avoid hitting the 100 RPM quota
+const BATCH_SIZE       = EMBEDDING_PROVIDER === "gemini" ? 15 : 10;
+const BATCH_DELAY_MS   = EMBEDDING_PROVIDER === "gemini" ? 1000 : 100;
 const MAX_CHARS        = 7_500;
 
 const CHUNKS_DIR = path.resolve(__dirname, "../chunks");
@@ -38,21 +40,26 @@ function djb2Hash(str: string): number {
 
 // ─── Qdrant Collection Setup ──────────────────────────────────────────────────
 
-async function ensureCollection(): Promise<void> {
+async function ensureCollection(force: boolean = false): Promise<void> {
   const existing = await qdrant.getCollections();
   const exists   = existing.collections.some((c) => c.name === COLLECTION_NAME);
 
   if (exists) {
-    // Check vector size
-    const info = await qdrant.getCollection(COLLECTION_NAME);
-    const currentSize = (info.config.params.vectors as any)?.size;
-    if (currentSize === VECTOR_SIZE) {
-      console.log(`Collection "${COLLECTION_NAME}" already exists with correct dimensions (${VECTOR_SIZE}) — skipping creation.`);
-      return;
-    }
+    if (force) {
+      console.log(`[FORCE] Recreating collection "${COLLECTION_NAME}"...`);
+      await qdrant.deleteCollection(COLLECTION_NAME);
+    } else {
+      // Check vector size
+      const info = await qdrant.getCollection(COLLECTION_NAME);
+      const currentSize = (info.config.params.vectors as any)?.size;
+      if (currentSize === VECTOR_SIZE) {
+        console.log(`Collection "${COLLECTION_NAME}" already exists with correct dimensions (${VECTOR_SIZE}) — skipping creation.`);
+        return;
+      }
 
-    console.log(`Collection "${COLLECTION_NAME}" has incorrect dimension (${currentSize}). Deleting and recreating for dimension ${VECTOR_SIZE}...`);
-    await qdrant.deleteCollection(COLLECTION_NAME);
+      console.log(`Collection "${COLLECTION_NAME}" has incorrect dimension (${currentSize}). Deleting and recreating for dimension ${VECTOR_SIZE}...`);
+      await qdrant.deleteCollection(COLLECTION_NAME);
+    }
   }
 
   await qdrant.createCollection(COLLECTION_NAME, {
@@ -92,34 +99,6 @@ function isGarbled(text: string): boolean {
   return garbageCount / text.length > 0.05; // >5% garbage = skip
 }
 
-async function embedBatch(texts: string[]): Promise<number[][]> {
-  const url = `${OLLAMA_URL}/api/embed`;
-
-  // Sanitize (strip mojibake/control chars) then truncate to stay within token limit.
-  const formattedTexts = texts.map((t) => {
-    const clean = sanitizeText(t);
-    const safe  = clean.length > MAX_CHARS ? clean.slice(0, MAX_CHARS) : clean;
-    return `search_document: ${safe}`;
-  });
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: EMBEDDING_MODEL,
-      input: formattedTexts,
-    }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Ollama API error: ${response.statusText} - ${errorText}`);
-  }
-
-  const data = (await response.json()) as { embeddings: number[][] };
-  return data.embeddings;
-}
-
 // ─── Upload ───────────────────────────────────────────────────────────────────
 
 async function uploadChunks(chunks: Chunk[]): Promise<void> {
@@ -145,8 +124,13 @@ async function uploadChunks(chunks: Chunk[]): Promise<void> {
   let uploaded = 0;
   for (let i = 0; i < total; i += BATCH_SIZE) {
     const batch  = goodChunks.slice(i, i + BATCH_SIZE);
-    const texts  = batch.map((c) => c.text);
-    const vectors = await embedBatch(texts);
+    
+    // Sanitize then truncate to stay within token limits before embedding
+    const texts  = batch.map((c) => {
+      const clean = sanitizeText(c.text);
+      return clean.length > MAX_CHARS ? clean.slice(0, MAX_CHARS) : clean;
+    });
+    const vectors = await embedBatch(texts, "document");
 
     const points = batch.map((chunk, idx) => ({
       id:      djb2Hash(chunk.chunk_id),
@@ -238,15 +222,21 @@ async function getExistingChunkIds(): Promise<Set<string>> {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  const args = process.argv.slice(2);
+  const FORCE_RECREATE = args.includes("--recreate") || args.includes("--force");
+
   console.log(`\n${"─".repeat(50)}`);
   console.log(`IP-SAKTI  ·  Embed & Upload (Ollama)`);
   console.log(`Collection : ${COLLECTION_NAME}  |  Qdrant: ${QDRANT_URL}`);
   console.log(`Model      : ${EMBEDDING_MODEL} (dim=${VECTOR_SIZE})`);
+  if (FORCE_RECREATE) {
+    console.log(`Mode       : FORCE RECREATE (dropping and re-embedding all chunks)`);
+  }
   console.log(`${"─".repeat(50)}\n`);
 
   try {
     // 1. Ensure Qdrant collection exists with correct dimensions
-    await ensureCollection();
+    await ensureCollection(FORCE_RECREATE);
 
     // 2. Load all chunks from disk
     console.log("\nLoading chunks from chunks/…");
@@ -254,10 +244,15 @@ async function main(): Promise<void> {
     console.log(`\nTotal chunks loaded: ${allChunks.length}`);
 
     // 3. Get already uploaded chunks
-    const existingChunkIds = await getExistingChunkIds();
-    console.log(`Found ${existingChunkIds.size} chunks already uploaded.`);
-
-    const chunksToUpload = allChunks.filter((c) => !existingChunkIds.has(c.chunk_id));
+    let chunksToUpload: Chunk[];
+    if (FORCE_RECREATE) {
+      console.log("Force option enabled: Skipping existing chunk check. Re-uploading all chunks.");
+      chunksToUpload = allChunks;
+    } else {
+      const existingChunkIds = await getExistingChunkIds();
+      console.log(`Found ${existingChunkIds.size} chunks already uploaded.`);
+      chunksToUpload = allChunks.filter((c) => !existingChunkIds.has(c.chunk_id));
+    }
     console.log(`Remaining chunks to embed & upload: ${chunksToUpload.length}`);
 
     if (chunksToUpload.length === 0) {

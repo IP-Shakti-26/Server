@@ -4,10 +4,10 @@ import path from "path";
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { Chunk } from "./types";
 
-const OLLAMA_URL       = process.env.OLLAMA_URL        ?? "http://localhost:11434";
-const QDRANT_URL       = process.env.QDRANT_URL        ?? "http://localhost:6333";
-const COLLECTION_NAME  = process.env.COLLECTION_NAME   ?? "ipsakti_docs";
-const EMBEDDING_MODEL  = "nomic-ipsakti";
+const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
+const QDRANT_URL = process.env.QDRANT_URL ?? "http://localhost:6333";
+const COLLECTION_NAME = process.env.COLLECTION_NAME ?? "ipsakti_docs";
+const EMBEDDING_MODEL = "nomic-embed-text:v1.5";
 
 const qdrant = new QdrantClient({ url: QDRANT_URL });
 const CHUNKS_DIR = path.resolve(__dirname, "../chunks");
@@ -111,7 +111,7 @@ async function main() {
   console.log(`Testing first ${maxToTest} non-garbled chunks...`);
   for (let i = 0; i < maxToTest; i++) {
     const chunk = goodRemaining[i];
-    console.log(`[${i+1}/${maxToTest}] Testing ${chunk.chunk_id} (len: ${chunk.text.length})...`);
+    console.log(`[${i + 1}/${maxToTest}] Testing ${chunk.chunk_id} (len: ${chunk.text.length})...`);
     const ok = await testEmbed(chunk.text);
     if (!ok) {
       failedCount++;
@@ -121,7 +121,7 @@ async function main() {
       console.log(`Original Text Length: ${chunk.text.length}`);
       const clean = sanitizeText(chunk.text);
       console.log(`Cleaned Text Length: ${clean.length}`);
-      
+
       // Let's print the first 300 characters showing their char codes
       const sample = clean.slice(0, 300);
       console.log("Sample characters and their charCodes:");
@@ -131,13 +131,13 @@ async function main() {
         codes.push(`${sample[j]} (${code})`);
       }
       console.log(codes.slice(0, 50).join(", ") + " ...");
-      
+
       // Let's count non-ascii characters (charCodeAt > 127)
       let nonAscii = 0;
       for (let j = 0; j < clean.length; j++) {
         if (clean.charCodeAt(j) > 127) nonAscii++;
       }
-      console.log(`Non-ASCII characters: ${nonAscii} (${(nonAscii/clean.length*100).toFixed(1)}%)`);
+      console.log(`Non-ASCII characters: ${nonAscii} (${(nonAscii / clean.length * 100).toFixed(1)}%)`);
 
       if (failedCount >= 5) {
         console.log("\nFound 5 failures, stopping diagnostic.");

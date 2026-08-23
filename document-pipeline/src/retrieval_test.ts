@@ -1,14 +1,12 @@
 import "dotenv/config";
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { Domain } from "./types";
+import { embedQuery, EMBEDDING_MODEL } from "./embeddings";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const OLLAMA_URL      = process.env.OLLAMA_URL       ?? "http://localhost:11434";
-const QDRANT_URL      = process.env.QDRANT_URL       ?? "http://localhost:6333";
+const QDRANT_URL      = process.env.QDRANT_URL       ?? "http://127.0.0.1:6333";
 const COLLECTION_NAME = process.env.COLLECTION_NAME  ?? "ipsakti_docs";
-
-const EMBEDDING_MODEL = "nomic-ipsakti"; // custom model: nomic-embed-text:v1.5 + num_ctx 4096
 
 // ─── Clients ──────────────────────────────────────────────────────────────────
 
@@ -32,24 +30,8 @@ export async function retrieve(
   domains: Domain[],
   topK:    number
 ): Promise<SearchResult[]> {
-  // 1. Embed query with Ollama
-  const url = `${OLLAMA_URL}/api/embed`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: EMBEDDING_MODEL,
-      input: [`search_query: ${query}`],
-    }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Ollama API error: ${response.statusText} - ${errorText}`);
-  }
-
-  const data = (await response.json()) as { embeddings: number[][] };
-  const vector = data.embeddings[0];
+  // 1. Embed query using unified embeddings module
+  const vector = await embedQuery(query);
 
   // 2. Build domain filter — match any of the provided domains
   const domainFilter =
