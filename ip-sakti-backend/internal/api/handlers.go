@@ -277,7 +277,7 @@ func (h *Handler) AnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 		BaseQuery:    sess.Classification.RawDescription,
 		Domains:      domainStrs,
 		Jurisdiction: "india",
-		TopK:         5,
+		TopK:         8,
 	})
 	if err != nil {
 		// RetrieveForDomains only returns a non-nil error for catastrophic failures;

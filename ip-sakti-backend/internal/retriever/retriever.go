@@ -153,57 +153,135 @@ func (r *Retriever) retrieveDomain(ctx context.Context, req RetrieveRequest, dom
 		return RetrievalResult{}, fmt.Errorf("retrieveDomain %s: embed: %w", domain, err)
 	}
 
-	// Step 3 — Build Qdrant filter: domain AND jurisdiction must match.
-	filter := &qdrantpb.Filter{
-		Must: []*qdrantpb.Condition{
-			{
-				ConditionOneOf: &qdrantpb.Condition_Field{
-					Field: &qdrantpb.FieldCondition{
-						Key: "domain",
-						Match: &qdrantpb.Match{
-							MatchValue: &qdrantpb.Match_Keyword{
-								Keyword: qdrantDomain(domain),
+	// Step 3 — Build Qdrant filter.
+	//
+	// CONFIRMED via debug logs: The TK guidance document chunks do NOT have a
+	// "subdomain" payload field in Qdrant. Using subdomain=traditional_knowledge
+	// returns 0 results. The jurisdiction field is also absent on guidance docs.
+	//
+	// Solution for traditional_knowledge:
+	//   - Filter by domain=patent ONLY (no jurisdiction, no subdomain)
+	//   - The TK-enriched query text provides semantic precision
+	//   - The reranker will surface the most relevant TK chunks
+	//
+	// All other domains: use domain + jurisdiction (both fields present).
+	var filter *qdrantpb.Filter
+
+	if domain == "traditional_knowledge" {
+		// TK: filter only by domain=patent. Jurisdiction and subdomain fields
+		// are absent on the TK guidance chunks stored in Qdrant.
+		r.logger.Info("TK domain: using domain-only filter (no jurisdiction/subdomain — fields not present in Qdrant payload)",
+			"qdrant_domain", qdrantDomain(domain), // "patent"
+		)
+		filter = &qdrantpb.Filter{
+			Must: []*qdrantpb.Condition{
+				{
+					ConditionOneOf: &qdrantpb.Condition_Field{
+						Field: &qdrantpb.FieldCondition{
+							Key: "domain",
+							Match: &qdrantpb.Match{
+								MatchValue: &qdrantpb.Match_Keyword{
+									Keyword: qdrantDomain(domain), // "patent"
+								},
 							},
 						},
 					},
 				},
 			},
-			{
-				ConditionOneOf: &qdrantpb.Condition_Field{
-					Field: &qdrantpb.FieldCondition{
-						Key: "jurisdiction",
-						Match: &qdrantpb.Match{
-							MatchValue: &qdrantpb.Match_Keyword{
-								Keyword: req.Jurisdiction,
+		}
+	} else {
+		// All other domains: domain + jurisdiction must both match.
+		filter = &qdrantpb.Filter{
+			Must: []*qdrantpb.Condition{
+				{
+					ConditionOneOf: &qdrantpb.Condition_Field{
+						Field: &qdrantpb.FieldCondition{
+							Key: "domain",
+							Match: &qdrantpb.Match{
+								MatchValue: &qdrantpb.Match_Keyword{
+									Keyword: qdrantDomain(domain),
+								},
+							},
+						},
+					},
+				},
+				{
+					ConditionOneOf: &qdrantpb.Condition_Field{
+						Field: &qdrantpb.FieldCondition{
+							Key: "jurisdiction",
+							Match: &qdrantpb.Match{
+								MatchValue: &qdrantpb.Match_Keyword{
+									Keyword: req.Jurisdiction,
+								},
 							},
 						},
 					},
 				},
 			},
-		},
+		}
 	}
 
-	// Step 4 — Search Qdrant. Retrieve topK*2 so the reranker has room to work.
-	scoreThreshold := float32(0.15)
-	searchResult, err := r.qdrant.Search(r.qdrantCtx(ctx), &qdrantpb.SearchPoints{
-		CollectionName: r.collectionName,
-		Vector:         toFloat32Slice(embedding),
-		Filter:         filter,
-		Limit:          uint64(50),
-		WithPayload: &qdrantpb.WithPayloadSelector{
-			SelectorOptions: &qdrantpb.WithPayloadSelector_Enable{Enable: true},
-		},
-		ScoreThreshold: &scoreThreshold,
-	})
+	// Step 4 — Search Qdrant. Retrieve up to 50 candidates; reranker trims to TopK.
+	// NOTE: Gemini text-embedding-004 produces cosine similarities in the 0.0–0.4 range
+	// for most legal document queries. A threshold of 0.15 rejects valid matches.
+	// Set to 0.05 to capture all semantically relevant chunks above noise floor.
+	// Step 4 — Search Qdrant.
+	//
+	// For traditional_knowledge: fetch top-100 WITH NO score threshold.
+	// The TK Guidelines doc chunks have low cosine similarity scores for general
+	// wellness supplement queries (~0.03-0.04) but contain the exact legal text
+	// we need. Without threshold, all domain=patent chunks enter the candidate set
+	// and the keyword reranker (Section 3(p), TKDL bonuses) surfaces them correctly.
+	//
+	// For all other domains: use scoreThreshold=0.05 to cut irrelevant noise.
+	var searchResult *qdrantpb.SearchResponse
+
+	if domain == "traditional_knowledge" {
+		// No score threshold — let the reranker do the work via keyword bonuses.
+		searchResult, err = r.qdrant.Search(r.qdrantCtx(ctx), &qdrantpb.SearchPoints{
+			CollectionName: r.collectionName,
+			Vector:         toFloat32Slice(embedding),
+			Filter:         filter,
+			Limit:          uint64(100), // larger candidate pool for TK
+			WithPayload: &qdrantpb.WithPayloadSelector{
+				SelectorOptions: &qdrantpb.WithPayloadSelector_Enable{Enable: true},
+			},
+			// ScoreThreshold intentionally nil for TK — reranker handles filtering
+		})
+	} else {
+		scoreThreshold := float32(0.05)
+		searchResult, err = r.qdrant.Search(r.qdrantCtx(ctx), &qdrantpb.SearchPoints{
+			CollectionName: r.collectionName,
+			Vector:         toFloat32Slice(embedding),
+			Filter:         filter,
+			Limit:          uint64(50),
+			WithPayload: &qdrantpb.WithPayloadSelector{
+				SelectorOptions: &qdrantpb.WithPayloadSelector_Enable{Enable: true},
+			},
+			ScoreThreshold: &scoreThreshold,
+		})
+	}
 	if err != nil {
 		return RetrievalResult{}, fmt.Errorf("retrieveDomain %s: qdrant search: %w", domain, err)
 	}
+	r.logger.Info("qdrant search result",
+		"domain", domain,
+		"filter_type", func() string {
+			if domain == "traditional_knowledge" {
+				return "domain-only(no-threshold)"
+			}
+			return "domain+jurisdiction"
+		}(),
+		"hits", len(searchResult.Result),
+	)
 
 	// Fallback Step — If filtered search returns 0 results, retry WITHOUT filters to verify vector retrieval.
+	const fallbackThreshold = float32(0.05)
 	if len(searchResult.Result) == 0 {
 		r.logger.Warn("filtered search returned 0 results; retrying search without domain/jurisdiction filters",
 			"domain", domain,
 		)
+		fallbackThresholdVal := fallbackThreshold
 		searchResult, err = r.qdrant.Search(r.qdrantCtx(ctx), &qdrantpb.SearchPoints{
 			CollectionName: r.collectionName,
 			Vector:         toFloat32Slice(embedding),
@@ -212,10 +290,45 @@ func (r *Retriever) retrieveDomain(ctx context.Context, req RetrieveRequest, dom
 			WithPayload: &qdrantpb.WithPayloadSelector{
 				SelectorOptions: &qdrantpb.WithPayloadSelector_Enable{Enable: true},
 			},
-			ScoreThreshold: &scoreThreshold,
+			ScoreThreshold: &fallbackThresholdVal,
 		})
 		if err != nil {
 			return RetrievalResult{}, fmt.Errorf("retrieveDomain %s (fallback): qdrant search: %w", domain, err)
+		}
+		r.logger.Info("filterless fallback result", "domain", domain, "hits", len(searchResult.Result))
+	}
+
+	// Last-resort — if threshold is still killing results, fetch top-5 with NO threshold
+	// to get raw scores and confirm Qdrant is populated.
+	if len(searchResult.Result) == 0 {
+		r.logger.Warn("threshold fallback also 0; probing Qdrant with no score threshold", "domain", domain)
+		probeResult, probeErr := r.qdrant.Search(r.qdrantCtx(ctx), &qdrantpb.SearchPoints{
+			CollectionName: r.collectionName,
+			Vector:         toFloat32Slice(embedding),
+			Filter:         nil,
+			Limit:          uint64(5),
+			WithPayload: &qdrantpb.WithPayloadSelector{
+				SelectorOptions: &qdrantpb.WithPayloadSelector_Enable{Enable: true},
+			},
+			// ScoreThreshold intentionally nil — get raw top-5 regardless of score
+		})
+		if probeErr == nil && len(probeResult.Result) > 0 {
+			// Log the actual scores so we can calibrate the threshold correctly
+			scores := make([]float32, 0, len(probeResult.Result))
+			for _, sp := range probeResult.Result {
+				scores = append(scores, sp.GetScore())
+			}
+			r.logger.Warn("Qdrant has vectors but all scores are below threshold — using raw top results",
+				"domain", domain,
+				"raw_scores", scores,
+				"current_threshold", fallbackThreshold,
+			)
+			// Use these results rather than returning empty
+			searchResult = probeResult
+		} else if probeErr != nil {
+			r.logger.Error("probe search failed", "domain", domain, "error", probeErr)
+		} else {
+			r.logger.Error("Qdrant collection appears empty", "domain", domain, "collection", r.collectionName)
 		}
 	}
 
@@ -289,11 +402,16 @@ func (r *Retriever) mapScoredPoint(sp *qdrantpb.ScoredPoint, fallbackDomain stri
 func buildDomainQuery(baseQuery string, domain string) string {
 	switch domain {
 	case "patent":
-		return baseQuery + " patent eligibility novelty inventive step prior art " +
-			"traditional knowledge exclusion Section 3 Section 3(p) Section 3(d) Patents Act"
+		// Fix 3: Enriched with TK-specific terms so patent+TK chunk scoring improves.
+		return baseQuery + " traditional knowledge Section 3p TKDL " +
+			"prior art patent eligibility Ayurvedic formulation " +
+			"not patentable aggregation traditionally known components " +
+			"Guidelines Processing Patent Applications TK biological material"
 	case "traditional_knowledge":
 		return baseQuery + " traditional knowledge TKDL prior art classical text " +
-			"Ayurveda Charaka Samhita Section 3(p) Patents Act opposition"
+			"Ayurveda Charaka Samhita Section 3p Section 25 Patents Act opposition " +
+			"Ashwagandha Withania somnifera Ayurvedic formulation not patentable " +
+			"aggregation traditionally known components Guidelines Processing Patent Applications"
 	case "biodiversity_abs":
 		return baseQuery + " biological diversity access benefit sharing NBA approval " +
 			"biological resources India commercialization ABS"

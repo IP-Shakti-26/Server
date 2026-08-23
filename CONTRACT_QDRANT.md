@@ -14,7 +14,7 @@ the **retriever (this service)** reads during search.
 
 ## Required Payload Fields
 
-Every document chunk upserted into the `ipsakti_chunks` collection MUST
+Every document chunk upserted into the `ipsakti_docs` collection MUST
 include all of the following fields:
 
 | Field        | Type   | Example value                             | Notes                                       |
@@ -60,7 +60,7 @@ at read time, but use lowercase for consistency):
 
 ## Qdrant Collection Details
 
-- **Collection name**: `ipsakti_chunks`
+- **Collection name**: `ipsakti_docs`
 - **Vector model**: `text-embedding-004` (Google AI)
 - **Embedding task type during ingestion**: `RETRIEVAL_DOCUMENT`
 - **Embedding task type during retrieval**: `RETRIEVAL_QUERY`
@@ -78,10 +78,10 @@ at read time, but use lowercase for consistency):
 For query performance, create payload indexes on the following fields:
 
 ```
-POST /collections/ipsakti_chunks/index
+POST /collections/ipsakti_docs/index
 { "field_name": "domain",       "field_schema": "keyword" }
 
-POST /collections/ipsakti_chunks/index
+POST /collections/ipsakti_docs/index
 { "field_name": "jurisdiction", "field_schema": "keyword" }
 ```
 
@@ -99,7 +99,7 @@ from qdrant_client.models import PointStruct
 client = QdrantClient(host="localhost", port=6333)
 
 client.upsert(
-    collection_name="ipsakti_chunks",
+    collection_name="ipsakti_docs",
     points=[
         PointStruct(
             id="<uuid>",
