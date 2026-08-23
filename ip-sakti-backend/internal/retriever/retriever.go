@@ -18,7 +18,7 @@ import (
 // qdrantCollection is the single Qdrant collection that stores all IP-SAKTI
 // document chunks. All domains share one collection; domain filtering is done
 // via Qdrant payload filters.
-const qdrantCollection = "ipsakti_chunks"
+const qdrantCollection = "ipsakti_docs"
 
 // domainOrder defines consistent output ordering for []RetrievalResult.
 // Synthesizer expects a stable domain order for structured output generation.
@@ -87,7 +87,7 @@ func qdrantDomain(domain string) string {
 func (r *Retriever) RetrieveForDomains(ctx context.Context, req RetrieveRequest) ([]RetrievalResult, error) {
 	// Step 1 — Apply defaults.
 	if req.TopK == 0 {
-		req.TopK = 5
+		req.TopK = 8
 	}
 	if req.Jurisdiction == "" {
 		req.Jurisdiction = "india"

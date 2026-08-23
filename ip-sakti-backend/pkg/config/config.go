@@ -11,18 +11,18 @@ import (
 // Config holds all application configuration loaded from environment variables.
 // It is loaded exactly once at startup and passed via dependency injection.
 type Config struct {
-	Port            string
-	DatabaseURL     string
-	GeminiAPIKey    string   // GEMINI_API_KEY, required
-	AnthropicAPIKey string   // ANTHROPIC_API_KEY, optional (future)
-	QdrantHost      string
-	QdrantPort      string   // HTTP REST port, default 6333
-	QdrantGRPCPort  string   // gRPC port, default 6334
-	QdrantAPIKey    string
-	QdrantCollection string  // QDRANT_COLLECTION, default "ipsakti_chunks"
-	OpenAIAPIKey    string   // OPENAI_API_KEY, optional (for embeddings, future)
-	Env             string
-	AllowedOrigins  []string
+	Port             string
+	DatabaseURL      string
+	GeminiAPIKey     string // GEMINI_API_KEY, required
+	AnthropicAPIKey  string // ANTHROPIC_API_KEY, optional (future)
+	QdrantHost       string
+	QdrantPort       string // HTTP REST port, default 6333
+	QdrantGRPCPort   string // gRPC port, default 6334
+	QdrantAPIKey     string
+	QdrantCollection string // QDRANT_COLLECTION, default "ipsakti_docs"
+	OpenAIAPIKey     string // OPENAI_API_KEY, optional (for embeddings, future)
+	Env              string
+	AllowedOrigins   []string
 }
 
 // Load reads the .env file (if present) and then reads environment variables.
@@ -32,18 +32,18 @@ func Load() (*Config, error) {
 	_ = godotenv.Load()
 
 	cfg := &Config{
-		Port:            getEnvOrDefault("SERVER_PORT", "8080"),
-		DatabaseURL:     os.Getenv("DATABASE_URL"),
-		GeminiAPIKey:    os.Getenv("GEMINI_API_KEY"),
-		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
-		QdrantHost:      getEnvOrDefault("QDRANT_HOST", "localhost"),
-		QdrantPort:      getEnvOrDefault("QDRANT_PORT", "6333"),
-		QdrantGRPCPort:  getEnvOrDefault("QDRANT_GRPC_PORT", "6334"),
-		QdrantAPIKey:    os.Getenv("QDRANT_API_KEY"),
-		QdrantCollection: getEnvOrDefault("QDRANT_COLLECTION", "ipsakti_chunks"),
-		OpenAIAPIKey:    os.Getenv("OPENAI_API_KEY"),
-		Env:             getEnvOrDefault("APP_ENV", "development"),
-		AllowedOrigins:  parseOrigins(getEnvOrDefault("ALLOWED_ORIGINS", "*")),
+		Port:             getEnvOrDefault("SERVER_PORT", "8080"),
+		DatabaseURL:      os.Getenv("DATABASE_URL"),
+		GeminiAPIKey:     os.Getenv("GEMINI_API_KEY"),
+		AnthropicAPIKey:  os.Getenv("ANTHROPIC_API_KEY"),
+		QdrantHost:       getEnvOrDefault("QDRANT_HOST", "localhost"),
+		QdrantPort:       getEnvOrDefault("QDRANT_PORT", "6333"),
+		QdrantGRPCPort:   getEnvOrDefault("QDRANT_GRPC_PORT", "6334"),
+		QdrantAPIKey:     os.Getenv("QDRANT_API_KEY"),
+		QdrantCollection: getEnvOrDefault("QDRANT_COLLECTION", "ipsakti_docs"),
+		OpenAIAPIKey:     os.Getenv("OPENAI_API_KEY"),
+		Env:              getEnvOrDefault("APP_ENV", "development"),
+		AllowedOrigins:   parseOrigins(getEnvOrDefault("ALLOWED_ORIGINS", "*")),
 	}
 
 	var errs []string
