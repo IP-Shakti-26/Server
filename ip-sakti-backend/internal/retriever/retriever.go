@@ -184,7 +184,7 @@ func (r *Retriever) retrieveDomain(ctx context.Context, req RetrieveRequest, dom
 	}
 
 	// Step 4 — Search Qdrant. Retrieve topK*2 so the reranker has room to work.
-	scoreThreshold := float32(0.01)
+	scoreThreshold := float32(0.15)
 	searchResult, err := r.qdrant.Search(r.qdrantCtx(ctx), &qdrantpb.SearchPoints{
 		CollectionName: r.collectionName,
 		Vector:         toFloat32Slice(embedding),
