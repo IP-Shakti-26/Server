@@ -221,116 +221,71 @@ func (r *Retriever) retrieveDomain(ctx context.Context, req RetrieveRequest, dom
 		}
 	}
 
-	// Step 4 — Search Qdrant. Retrieve up to 50 candidates; reranker trims to TopK.
-	// NOTE: Gemini text-embedding-004 produces cosine similarities in the 0.0–0.4 range
-	// for most legal document queries. A threshold of 0.15 rejects valid matches.
-	// Set to 0.05 to capture all semantically relevant chunks above noise floor.
 	// Step 4 — Search Qdrant.
 	//
-	// For traditional_knowledge: fetch top-100 WITH NO score threshold.
-	// The TK Guidelines doc chunks have low cosine similarity scores for general
-	// wellness supplement queries (~0.03-0.04) but contain the exact legal text
-	// we need. Without threshold, all domain=patent chunks enter the candidate set
-	// and the keyword reranker (Section 3(p), TKDL bonuses) surfaces them correctly.
+	// CRITICAL LESSON: Gemini text-embedding-004 produces very low cosine
+	// similarities (0.02-0.08) for legal documents queried with product
+	// descriptions. ANY score threshold reliably kills valid chunks for
+	// biodiversity, regulatory, patent, and TK domains.
 	//
-	// For all other domains: use scoreThreshold=0.05 to cut irrelevant noise.
+	// FIX: Fetch top-100 with NO score threshold for ALL domains.
+	// The keyword reranker (domain-specific bonuses) surfaces the right chunks.
+	// The finalScore = 0.55*vectorScore + 0.45*authorityScore + keywordBonus
+	// provides strong quality signal without a hard threshold gate.
 	var searchResult *qdrantpb.SearchResponse
-
-	if domain == "traditional_knowledge" {
-		// No score threshold — let the reranker do the work via keyword bonuses.
-		searchResult, err = r.qdrant.Search(r.qdrantCtx(ctx), &qdrantpb.SearchPoints{
-			CollectionName: r.collectionName,
-			Vector:         toFloat32Slice(embedding),
-			Filter:         filter,
-			Limit:          uint64(100), // larger candidate pool for TK
-			WithPayload: &qdrantpb.WithPayloadSelector{
-				SelectorOptions: &qdrantpb.WithPayloadSelector_Enable{Enable: true},
-			},
-			// ScoreThreshold intentionally nil for TK — reranker handles filtering
-		})
-	} else {
-		scoreThreshold := float32(0.05)
-		searchResult, err = r.qdrant.Search(r.qdrantCtx(ctx), &qdrantpb.SearchPoints{
-			CollectionName: r.collectionName,
-			Vector:         toFloat32Slice(embedding),
-			Filter:         filter,
-			Limit:          uint64(50),
-			WithPayload: &qdrantpb.WithPayloadSelector{
-				SelectorOptions: &qdrantpb.WithPayloadSelector_Enable{Enable: true},
-			},
-			ScoreThreshold: &scoreThreshold,
-		})
-	}
+	searchResult, err = r.qdrant.Search(r.qdrantCtx(ctx), &qdrantpb.SearchPoints{
+		CollectionName: r.collectionName,
+		Vector:         toFloat32Slice(embedding),
+		Filter:         filter,
+		Limit:          uint64(100), // fetch wide — reranker trims to TopK
+		WithPayload: &qdrantpb.WithPayloadSelector{
+			SelectorOptions: &qdrantpb.WithPayloadSelector_Enable{Enable: true},
+		},
+		// ScoreThreshold intentionally nil — reranker handles quality filtering
+	})
 	if err != nil {
 		return RetrievalResult{}, fmt.Errorf("retrieveDomain %s: qdrant search: %w", domain, err)
 	}
 	r.logger.Info("qdrant search result",
 		"domain", domain,
-		"filter_type", func() string {
-			if domain == "traditional_knowledge" {
-				return "domain-only(no-threshold)"
-			}
-			return "domain+jurisdiction"
-		}(),
 		"hits", len(searchResult.Result),
 	)
 
-	// Fallback Step — If filtered search returns 0 results, retry WITHOUT filters to verify vector retrieval.
-	const fallbackThreshold = float32(0.05)
-	if len(searchResult.Result) == 0 {
-		r.logger.Warn("filtered search returned 0 results; retrying search without domain/jurisdiction filters",
-			"domain", domain,
-		)
-		fallbackThresholdVal := fallbackThreshold
+	// Fallback — if domain+jurisdiction filter returned 0 (e.g. jurisdiction
+	// field absent on some docs), retry with domain-only filter.
+	if len(searchResult.Result) == 0 && domain != "traditional_knowledge" {
+		r.logger.Warn("domain+jurisdiction returned 0; retrying with domain-only filter", "domain", domain)
+		domainOnlyFilter := &qdrantpb.Filter{
+			Must: []*qdrantpb.Condition{
+				{
+					ConditionOneOf: &qdrantpb.Condition_Field{
+						Field: &qdrantpb.FieldCondition{
+							Key: "domain",
+							Match: &qdrantpb.Match{
+								MatchValue: &qdrantpb.Match_Keyword{
+									Keyword: qdrantDomain(domain),
+								},
+							},
+						},
+					},
+				},
+			},
+		}
 		searchResult, err = r.qdrant.Search(r.qdrantCtx(ctx), &qdrantpb.SearchPoints{
 			CollectionName: r.collectionName,
 			Vector:         toFloat32Slice(embedding),
-			Filter:         nil, // no payload filters
-			Limit:          uint64(50),
+			Filter:         domainOnlyFilter,
+			Limit:          uint64(100),
 			WithPayload: &qdrantpb.WithPayloadSelector{
 				SelectorOptions: &qdrantpb.WithPayloadSelector_Enable{Enable: true},
 			},
-			ScoreThreshold: &fallbackThresholdVal,
 		})
 		if err != nil {
-			return RetrievalResult{}, fmt.Errorf("retrieveDomain %s (fallback): qdrant search: %w", domain, err)
+			return RetrievalResult{}, fmt.Errorf("retrieveDomain %s (domain-only fallback): qdrant search: %w", domain, err)
 		}
-		r.logger.Info("filterless fallback result", "domain", domain, "hits", len(searchResult.Result))
+		r.logger.Info("domain-only fallback result", "domain", domain, "hits", len(searchResult.Result))
 	}
 
-	// Last-resort — if threshold is still killing results, fetch top-5 with NO threshold
-	// to get raw scores and confirm Qdrant is populated.
-	if len(searchResult.Result) == 0 {
-		r.logger.Warn("threshold fallback also 0; probing Qdrant with no score threshold", "domain", domain)
-		probeResult, probeErr := r.qdrant.Search(r.qdrantCtx(ctx), &qdrantpb.SearchPoints{
-			CollectionName: r.collectionName,
-			Vector:         toFloat32Slice(embedding),
-			Filter:         nil,
-			Limit:          uint64(5),
-			WithPayload: &qdrantpb.WithPayloadSelector{
-				SelectorOptions: &qdrantpb.WithPayloadSelector_Enable{Enable: true},
-			},
-			// ScoreThreshold intentionally nil — get raw top-5 regardless of score
-		})
-		if probeErr == nil && len(probeResult.Result) > 0 {
-			// Log the actual scores so we can calibrate the threshold correctly
-			scores := make([]float32, 0, len(probeResult.Result))
-			for _, sp := range probeResult.Result {
-				scores = append(scores, sp.GetScore())
-			}
-			r.logger.Warn("Qdrant has vectors but all scores are below threshold — using raw top results",
-				"domain", domain,
-				"raw_scores", scores,
-				"current_threshold", fallbackThreshold,
-			)
-			// Use these results rather than returning empty
-			searchResult = probeResult
-		} else if probeErr != nil {
-			r.logger.Error("probe search failed", "domain", domain, "error", probeErr)
-		} else {
-			r.logger.Error("Qdrant collection appears empty", "domain", domain, "collection", r.collectionName)
-		}
-	}
 
 	// Step 5 — Map ScoredPoints → []Chunk.
 	chunks := make([]Chunk, 0, len(searchResult.Result))
