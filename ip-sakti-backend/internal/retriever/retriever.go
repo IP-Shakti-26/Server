@@ -307,21 +307,40 @@ func (r *Retriever) retrieveDomain(ctx context.Context, req RetrieveRequest, dom
 
 // mapScoredPoint converts a Qdrant ScoredPoint to a Chunk.
 // Missing payload fields are zero/empty — never panics.
+//
+// CRITICAL: Chunk.ID is set to the payload chunk_id (e.g.
+// "the_trade_marks_act,_1999_chunk_0082"), NOT the Qdrant numeric point ID.
+// The evidence context prints [CHUNK ID: <chunk.ID>] and the LLM copies that
+// string verbatim into citations. The synthesizer's evidenceIndex is keyed by
+// chunk.ID, so both sides must use the same value. Using the Qdrant numeric ID
+// causes an ID mismatch that silently drops all citations and downgrades every
+// domain to insufficient_evidence.
 func (r *Retriever) mapScoredPoint(sp *qdrantpb.ScoredPoint, fallbackDomain string) Chunk {
 	payload := sp.GetPayload()
 
 	text := getPayloadString(payload, "text")
 	docTitle := getPayloadString(payload, "doc_title")
 
+	// Use the payload chunk_id as the canonical Chunk.ID.
+	// Fall back to the Qdrant numeric point ID only if the payload field is absent.
+	chunkID := getPayloadString(payload, "chunk_id")
+	if chunkID == "" {
+		chunkID = pointID(sp)
+		r.logger.Warn("qdrant point missing 'chunk_id' payload field — using numeric point ID",
+			"point_id", pointID(sp),
+			"domain", fallbackDomain,
+		)
+	}
+
 	if text == "" {
 		r.logger.Warn("qdrant point missing 'text' field",
-			"point_id", pointID(sp),
+			"chunk_id", chunkID,
 			"domain", fallbackDomain,
 		)
 	}
 	if docTitle == "" {
 		r.logger.Warn("qdrant point missing 'doc_title' field",
-			"point_id", pointID(sp),
+			"chunk_id", chunkID,
 			"domain", fallbackDomain,
 		)
 	}
@@ -335,7 +354,7 @@ func (r *Retriever) mapScoredPoint(sp *qdrantpb.ScoredPoint, fallbackDomain stri
 	}
 
 	return Chunk{
-		ID:           pointID(sp),
+		ID:           chunkID,
 		Text:         text,
 		DocTitle:     docTitle,
 		Section:      getPayloadString(payload, "section_ref"),
