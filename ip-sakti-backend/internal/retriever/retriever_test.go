@@ -91,8 +91,12 @@ func TestRerank_NilInput(t *testing.T) {
 
 func TestBuildDomainQuery_PatentContainsPatentsAct(t *testing.T) {
 	q := buildDomainQuery("Ashwagandha formulation", "patent")
-	if !strings.Contains(q, "Patents Act") {
-		t.Errorf("patent query missing 'Patents Act': %q", q)
+	// The patent query is enriched with TK/Section 3(p) terms for better retrieval.
+	if !strings.Contains(q, "Section 3p") {
+		t.Errorf("patent query missing 'Section 3p': %q", q)
+	}
+	if !strings.Contains(q, "patent eligibility") {
+		t.Errorf("patent query missing 'patent eligibility': %q", q)
 	}
 }
 

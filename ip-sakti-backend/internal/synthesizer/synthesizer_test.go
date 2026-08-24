@@ -237,7 +237,7 @@ func TestBuildEvidenceContext_DomainWithNoChunks(t *testing.T) {
 func TestBuildEvidenceContext_LongChunkTextIsTruncated(t *testing.T) {
 	t.Parallel()
 
-	longText := strings.Repeat("A", 800) // 800 chars, exceeds 600 limit
+	longText := strings.Repeat("A", 1200) // 1200 chars, exceeds 800-char limit
 
 	evidence := []retriever.RetrievalResult{
 		{
@@ -256,15 +256,15 @@ func TestBuildEvidenceContext_LongChunkTextIsTruncated(t *testing.T) {
 
 	result := buildEvidenceContext(evidence)
 
-	// The text in the output should be truncated to 600 chars + "..."
+	// The text in the output should be truncated to 800 chars + "..."
 	if strings.Contains(result, longText) {
 		t.Error("expected long text to be truncated, but full text found in output")
 	}
 	if !strings.Contains(result, "...") {
 		t.Error("expected '...' ellipsis after truncated text")
 	}
-	// Verify the truncated portion is 600 chars.
-	truncated := longText[:600] + "..."
+	// Verify the truncated portion is 800 chars.
+	truncated := longText[:800] + "..."
 	if !strings.Contains(result, truncated) {
 		t.Error("expected truncated text + ellipsis in output")
 	}
