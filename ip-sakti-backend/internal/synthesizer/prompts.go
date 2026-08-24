@@ -161,8 +161,11 @@ REMINDER: Output ONLY this JSON. Nothing else.`
 // exceed this, lower-scoring chunks are dropped first.
 func buildEvidenceContext(evidence []retriever.RetrievalResult) string {
 	const (
-		maxContextBytes  = 12000
-		maxChunkTextLen  = 600
+		// 40K chars gives Gemini plenty of legal evidence while staying well within
+		// its context window. This fixes regulatory/trademark being cut off when
+		// patent + TK + biodiversity fill the old 12K budget.
+		maxContextBytes = 40000
+		maxChunkTextLen = 800
 	)
 
 	var sb strings.Builder
@@ -217,44 +220,48 @@ func buildEvidenceContext(evidence []retriever.RetrievalResult) string {
 		}
 	}
 
-	// Build the context string, enforcing the character budget.
-	// Domain headers for empty domains are always included.
-	// Chunk blocks are dropped lowest-score-first if over budget.
-	//
-	// Simple greedy approach: write everything, track budget.
-	// If we exceed, rebuild without the lowest-score chunks.
-	//
-	// For MVP: just write greedily and stop when budget is nearly consumed.
-	// We track remaining bytes and skip chunk blocks (not headers) if needed.
+	// Fair per-domain budget allocation.
+	// Each domain gets an equal share of the total budget. This prevents
+	// early domains (patent, TK) from monopolising the context window and
+	// leaving later domains (regulatory, trademark) with no evidence.
+	nDomains := len(evidence)
+	if nDomains == 0 {
+		nDomains = 1
+	}
+	perDomainBudget := maxContextBytes / nDomains
 
-	// Sort-free budget approach: write all, skip lowest-scoring chunks if budget exceeded.
-	// We do a single pass with a running byte counter.
-	remainingBudget := maxContextBytes
-
-	// Track which domain headers we've already written.
-	writtenHeaders := make(map[string]bool)
-
+	// Group lines by domain header for fair allocation.
+	type domainBlock struct {
+		header string
+		chunks []chunkLine
+	}
+	var domainBlocks []domainBlock
+	domainIndex := make(map[string]int)
 	for _, line := range lines {
-		// Always write domain header once per domain.
-		if !writtenHeaders[line.domainHeader] {
-			sb.WriteString(line.domainHeader)
-			remainingBudget -= len(line.domainHeader)
-			writtenHeaders[line.domainHeader] = true
+		idx, ok := domainIndex[line.domainHeader]
+		if !ok {
+			domainIndex[line.domainHeader] = len(domainBlocks)
+			domainBlocks = append(domainBlocks, domainBlock{header: line.domainHeader})
+			idx = len(domainBlocks) - 1
 		}
+		domainBlocks[idx].chunks = append(domainBlocks[idx].chunks, line)
+	}
 
-		// For empty-domain markers, always write.
-		if line.authority == -1 {
-			sb.WriteString(line.chunkBlock)
-			remainingBudget -= len(line.chunkBlock)
-			continue
+	for _, db := range domainBlocks {
+		sb.WriteString(db.header)
+		domainRemaining := perDomainBudget - len(db.header)
+		for _, line := range db.chunks {
+			// Empty-domain marker: always include.
+			if line.authority == -1 {
+				sb.WriteString(line.chunkBlock)
+				break
+			}
+			if domainRemaining > len(line.chunkBlock) {
+				sb.WriteString(line.chunkBlock)
+				domainRemaining -= len(line.chunkBlock)
+			}
+			// If over per-domain budget, skip remaining chunks for this domain.
 		}
-
-		// Only write chunk blocks if within budget.
-		if remainingBudget > len(line.chunkBlock) {
-			sb.WriteString(line.chunkBlock)
-			remainingBudget -= len(line.chunkBlock)
-		}
-		// If over budget, silently skip. The domain header is already written.
 	}
 
 	sb.WriteString("\n=== END EVIDENCE CONTEXT ===\n")
