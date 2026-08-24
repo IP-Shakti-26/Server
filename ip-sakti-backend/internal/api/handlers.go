@@ -72,8 +72,8 @@ func (h *Handler) DebugRetrieveHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	evidence, err := h.retriever.RetrieveForDomains(ctx, retriever.RetrieveRequest{
-		BaseQuery:    "Ashwagandha joint pain formulation patent India",
-		Domains:      []string{"patent", "biodiversity_abs", "traditional_knowledge"},
+		BaseQuery:    "Ashwagandha joint pain formulation patent India brand name commercial sale",
+		Domains:      []string{"patent", "biodiversity_abs", "traditional_knowledge", "regulatory", "trademark"},
 		Jurisdiction: "india",
 		TopK:         3,
 	})
